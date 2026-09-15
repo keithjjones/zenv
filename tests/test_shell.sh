@@ -985,14 +985,17 @@ test_the_reminder_reports_drift_it_cannot_name_a_commit_for() {
     assert_not_contains "$ERR" 'git -C' 'but no commit is invented'
 }
 
-test_a_tree_that_is_gone_is_not_reminded_about() {
-    # gone and none are normal states doctor reports as information; a warning on
-    # every activation would be noise, and there is nothing to check out.
+test_a_tree_that_is_gone_is_reminded_about() {
+    # A missing tree is not drift (nothing to compare against) and there is no
+    # commit to name for a checkout, but the tree being gone at all is new
+    # information the activating shell should hear, not swallow silently.
     mkenv a version=9.1.0-dev.42 zeek_dist="$SANDBOX/never-existed" || return 1
 
     capture zenv shell activate a || fail "activation must succeed"
+    assert_contains "$ERR" "$SANDBOX/never-existed" 'the missing tree is named'
+    assert_contains "$ERR" 'not there any more' 'and named as missing'
     assert_not_contains "$ERR" 'disagree' 'a missing tree is not drift'
-    assert_not_contains "$ERR" 'checkout'
+    assert_not_contains "$ERR" 'checkout' 'there is no commit to check out'
 }
 
 # ---------------------------------------------------------------------------

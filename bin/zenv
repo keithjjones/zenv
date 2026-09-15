@@ -18,7 +18,7 @@
 
 set -u
 
-ZENV_VERSION=0.1.0
+ZENV_VERSION=0.1.1
 
 # Rewritten by `install.sh --root DIR` to bake a machine-wide default. Empty
 # means "no installed default", so `zenv root` can tell level 2 from level 3.
@@ -1189,7 +1189,7 @@ _dist_has_commit() {
 #
 # _dist_reminder <name> <prefix> sets:
 #   _REMIND        the lines to print, empty when there is nothing to say
-#   _REMIND_STATE  none | ok | unbuilt | checkout | unknown-commit | drifted
+#   _REMIND_STATE  none | ok | unbuilt | gone | checkout | unknown-commit | drifted
 _dist_reminder() {
     _drn=$1
     _drp=$2
@@ -1202,14 +1202,24 @@ _dist_reminder() {
     _drdist=$("$_drzc" --zeek_dist 2>/dev/null) || _drdist=
     _dist_tree "$_drn" "$_drdist"
     _drtree=$_DIST_TREE
-    # No tree, or a tree that is not there any more: nothing to check out, and
-    # `zenv doctor` already reports both as information rather than a fault.
-    [ -n "$_drtree" ] && [ -d "$_drtree" ] || return 0
+    # No tree recorded at all: nothing to check out, and that is the normal
+    # state for a binary-packaged Zeek. A tree that *was* recorded but is gone
+    # is not the same silence -- something deleted or moved what this env was
+    # built from, and the case below says so.
+    [ -n "$_drtree" ] || return 0
 
     _dist_state "$_drtree" "$_drver"
     case $_DIST_STATE in
         verified)
             _REMIND_STATE=ok
+            return 0
+            ;;
+        gone)
+            _REMIND_STATE=gone
+            _REMIND="'$_drn': $_DIST_WHY
+      nothing in this shell reads that tree -- only a package build that
+      passes --zeek-dist does, and zenv keeps zeek_dist empty rather than
+      let it"
             return 0
             ;;
         drifted) : ;;
