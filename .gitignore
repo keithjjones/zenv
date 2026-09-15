@@ -1,0 +1,10 @@
+# The vendored Zeek checkout is reference material for whoever is working in this
+# directory -- zenv never builds it, and nothing in bin/ or tests/ reads it. It is
+# deliberately *not* part of the repository, so nothing that ships may depend on
+# it: the docs cite upstream URLs rather than relative paths into this tree, and
+# the suite runs on a fresh clone with no Zeek source and no Zeek install.
+/zeek/
+
+# Test leftovers, if a run is interrupted before its cleanup.
+/tests/**/tmp.*
+.DS_Store

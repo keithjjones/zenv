@@ -1,0 +1,127 @@
+#compdef zenv
+# zsh completion for zenv.  Installed by install.sh to
+# ~/.local/share/zsh/site-functions/_zenv.
+#
+# That directory is on the default fpath for a Homebrew zsh but not for Apple's
+# /bin/zsh, so if completion does not appear, add this line to ~/.zshrc *before*
+# compinit and start a new shell:
+#
+#     fpath=(~/.local/share/zsh/site-functions $fpath)
+#
+# install.sh says the same thing rather than writing that line itself: it belongs
+# above a compinit whose position only you know, and a line zenv cannot place
+# exactly is a line `zenv uninstall` cannot remove exactly.
+#
+# Environment names come from `zenv list --names` -- one name per line, nothing
+# else. This file parses no metadata of its own, so it cannot disagree with zenv
+# about what an environment is.
+
+_zenv_envs() {
+    local -a names
+    names=(${(f)"$(zenv list --names 2>/dev/null)"})
+    _describe -t zenv-envs 'environment' names
+}
+
+_zenv() {
+    local -a commands
+    commands=(
+        'root:print the parent directory, and where it came from'
+        'list:list environments'
+        'prefix:print an environment install prefix -- your --prefix'
+        'zkgdir:print an environment zkg state directory'
+        'dist:print an environment source tree, only if it verifies'
+        'status:everything about one environment, in one screen'
+        'doctor:diagnose problems'
+        'version:print zenv version'
+        'new:create an empty environment and print its prefix'
+        'adopt:register an install that already exists'
+        'autoconfig:wire an environment zkg to the install at its prefix'
+        'init:emit the shell function for your rc file'
+        'activate:use an environment in this shell'
+        'deactivate:restore this shell'
+        'exec:run one command in an environment without activating'
+        'shell:print the shell code activate evaluates'
+        'link:point ~/zeek and ~/.zkg at an environment'
+        'unlink:remove those two symlinks'
+        'remove:delete an environment'
+        'restore:undo adopt --move, putting the install back'
+        'uninstall:remove zenv itself, and say what it leaves behind'
+        'help:the command list'
+    )
+
+    local curcontext=$curcontext state line
+    _arguments -C '1:command:->command' '*::arguments:->arguments' && return
+
+    case $state in
+        command)
+            _describe -t zenv-commands 'zenv command' commands
+            ;;
+        arguments)
+            case $words[1] in
+                prefix | zkgdir | dist | status | doctor | activate | link)
+                    _zenv_envs
+                    ;;
+                autoconfig)
+                    _arguments '--fix-paths[repair a stale manifest.json first]' \
+                        '*:environment:_zenv_envs'
+                    ;;
+                new)
+                    _arguments '--src[the source tree this environment is built from]:directory:_files -/' \
+                        '*:name:'
+                    ;;
+                adopt)
+                    _arguments \
+                        '--from[the install to adopt]:directory:_files -/' \
+                        '--zkg[the zkg state directory to adopt]:directory:_files -/' \
+                        '--move[move the trees into the environment]' \
+                        '--link[point the environment at them where they are]' \
+                        '*:name:_zenv_envs'
+                    ;;
+                remove | rm)
+                    _arguments \
+                        '--keep-zkg[keep the zkg state directory]' \
+                        '--yes[do not ask]' \
+                        '--force[remove even when linked or active]' \
+                        '*:environment:_zenv_envs'
+                    ;;
+                restore)
+                    _arguments \
+                        '--dry-run[say what would happen, change nothing]' \
+                        '--yes[do not ask]' \
+                        '*:environment:_zenv_envs'
+                    ;;
+                uninstall)
+                    _arguments \
+                        '--dry-run[say what would happen, change nothing]' \
+                        '--purge[also remove the installs you built]' \
+                        '--yes[do not ask]'
+                    ;;
+                list | ls)
+                    _arguments '--names[one name per line, nothing else]'
+                    ;;
+                root)
+                    _arguments '--source[print only where the root came from]'
+                    ;;
+                exec)
+                    if (( CURRENT == 2 )); then
+                        _zenv_envs
+                    else
+                        _normal
+                    fi
+                    ;;
+                init)
+                    _values 'shell' sh bash zsh
+                    ;;
+                shell)
+                    if (( CURRENT == 2 )); then
+                        _values 'subcommand' activate deactivate
+                    else
+                        _zenv_envs
+                    fi
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_zenv "$@"

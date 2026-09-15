@@ -1,0 +1,4402 @@
+#!/bin/sh
+# zenv -- a venv-style environment manager for Zeek + zkg.
+#
+# zenv never builds Zeek. It creates directories, tells you the --prefix to
+# install into, wires zkg up afterwards, and sets your shell environment.
+# The build stays yours: no configure, no make, no cmake is ever executed here.
+#
+# Human-readable output goes to stderr; only machine-readable values (paths,
+# shell code) go to stdout, so `eval "$(zenv shell activate x)"` can never be
+# corrupted by a diagnostic.
+#
+# shellcheck disable=SC2016
+#   Emitting shell code is half of what this script does: every `$` inside a
+#   single-quoted printf format is meant to reach the caller's shell unexpanded,
+#   and expanding it here is precisely the bug. Asserted per-line by
+#   tests/test_shell.sh, which evals the output in a fresh shell and compares
+#   the resulting environment.
+
+set -u
+
+ZENV_VERSION=0.1.0
+
+# Rewritten by `install.sh --root DIR` to bake a machine-wide default. Empty
+# means "no installed default", so `zenv root` can tell level 2 from level 3.
+ZENV_ROOT_DEFAULT=""
+
+# What `install.sh` puts on this machine, and therefore exactly what `zenv
+# uninstall` takes away. Derived from $HOME rather than baked, so the installed
+# script needs no second rewritten line and an uninstall run from anywhere --
+# the repo copy, the installed copy, uninstall.sh -- resolves the same three
+# paths. install.sh hardcodes the same three; tests/test_uninstall.sh asserts
+# the two agree, since a drift here would leave files behind.
+ZENV_INSTALL_SUBDIR=.local
+
+# The rc block's markers. A marker-delimited block can be removed exactly, which
+# is the whole reason install.sh writes the block instead of printing it for you
+# to paste. install.sh carries the same two literals.
+ZENV_RC_BEGIN='# >>> zenv >>>'
+ZENV_RC_END='# <<< zenv <<<'
+
+# Characters allowed in an env name. Spelled out rather than as A-Za-z0-9 ranges
+# because bracket-expression ranges depend on the collation locale.
+_N_FIRST='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+_N_REST="$_N_FIRST._-"
+
+CR=$(printf '\r')
+
+# A literal newline, used to carry lists of paths that may contain spaces. A
+# newline is the one character a filesystem path cannot contain, so it separates
+# where ':' (a PATH separator) and ' ' (legal in a path) both cannot.
+NL='
+'
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+_say() { printf '%s\n' "$*" >&2; }
+_warn() { printf 'zenv: %s\n' "$*" >&2; }
+_die() {
+    printf 'zenv: %s\n' "$*" >&2
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+# Strip trailing slashes, leaving "/" alone.
+_strip_slash() {
+    _ss=$1
+    while :; do
+        case $_ss in
+            /) break ;;
+            */) _ss=${_ss%/} ;;
+            *) break ;;
+        esac
+    done
+    printf '%s' "$_ss"
+}
+
+# Resolve a path physically. Works for a nonexistent leaf, which matters because
+# `zenv new` resolves a prefix before anything is installed there.
+# `realpath` and `readlink -f` are not portable enough to rely on.
+_realpath() {
+    _rp=$(_strip_slash "$1")
+    if [ -z "$_rp" ]; then
+        return 1
+    fi
+    if [ -d "$_rp" ]; then
+        (cd -P "$_rp" 2>/dev/null && pwd -P)
+        return $?
+    fi
+    _rp_d=${_rp%/*}
+    _rp_b=${_rp##*/}
+    case $_rp in
+        */*) : ;;
+        *) _rp_d=. ;;
+    esac
+    [ -n "$_rp_d" ] || _rp_d=/
+    _rp_r=$(cd -P "$_rp_d" 2>/dev/null && pwd -P) || return 1
+    case $_rp_r in
+        /) printf '/%s\n' "$_rp_b" ;;
+        *) printf '%s/%s\n' "$_rp_r" "$_rp_b" ;;
+    esac
+}
+
+# Resolve the parent directory, described in three levels; the first hit wins.
+#   1. $ZENV_ROOT                      this shell / this command
+#   2. the default baked by install.sh --root DIR   this machine
+#   3. $HOME/zenv                      built-in
+# Sets ZENV_ROOT_RESOLVED and ZENV_ROOT_SOURCE. Deliberately not a config file:
+# a pointer cannot live inside the directory it points at.
+_zenv_root() {
+    if [ -n "${ZENV_ROOT_RESOLVED:-}" ]; then
+        return 0
+    fi
+    # Scratch names are _zr_* rather than something short: this runs at the top
+    # level of whichever command called it, so a generic _src would clobber
+    # cmd_new's --src.
+    if [ -n "${ZENV_ROOT+set}" ]; then
+        if [ -z "$ZENV_ROOT" ]; then
+            _die "ZENV_ROOT is set but empty; unset it or give an absolute path"
+        fi
+        _zr_r=$ZENV_ROOT
+        _zr_src=environment
+    elif [ -n "$ZENV_ROOT_DEFAULT" ]; then
+        _zr_r=$ZENV_ROOT_DEFAULT
+        _zr_src='installed default'
+    else
+        if [ -z "${HOME:-}" ]; then
+            _die "HOME is not set, so the built-in default root cannot be resolved"
+        fi
+        _zr_r=$HOME/zenv
+        _zr_src='built-in default'
+    fi
+
+    case $_zr_r in
+        /*) : ;;
+        *) _die "root must be an absolute path, got: $_zr_r (from $_zr_src)" ;;
+    esac
+
+    _zr_r=$(_strip_slash "$_zr_r")
+    [ -n "$_zr_r" ] || _die "root resolved to an empty path (from $_zr_src)"
+    if [ "$_zr_r" = / ]; then
+        _die "root must not be / (from $_zr_src)"
+    fi
+
+    # Physical, so every prefix zenv reports is the real path an install can
+    # bake (finding 1). Silent if it cannot be resolved yet -- a root several
+    # levels deep does not exist until `zenv new` creates it, and
+    # _resolve_root_after_mkdir picks it up there.
+    if _zr_p=$(_realpath "$_zr_r") && [ -n "$_zr_p" ]; then
+        _zr_r=$_zr_p
+    fi
+
+    ZENV_ROOT_RESOLVED=$_zr_r
+    ZENV_ROOT_SOURCE=$_zr_src
+}
+
+# Called once the root is known to exist, so a root whose parents were created
+# along with it still yields a physical path.
+_resolve_root_after_mkdir() {
+    if _rrm=$(_realpath "$ZENV_ROOT_RESOLVED") && [ -n "$_rrm" ]; then
+        ZENV_ROOT_RESOLVED=$_rrm
+    fi
+}
+
+_root() {
+    _zenv_root
+    printf '%s' "$ZENV_ROOT_RESOLVED"
+}
+
+# ---------------------------------------------------------------------------
+# key=value files (root/config and root/<name>/env)
+#
+# Parsed with a read loop, never `.`/source, so a stray value cannot execute
+# code. Tolerates CRLF, blank lines, # comments, surrounding whitespace, and
+# values containing '='. On a duplicate key the last one wins.
+# ---------------------------------------------------------------------------
+
+_trim() {
+    _t=$1
+    while :; do
+        case $_t in
+            ' '* | "	"* | "$CR"*) _t=${_t#?} ;;
+            *) break ;;
+        esac
+    done
+    while :; do
+        case $_t in
+            *' ' | *"	" | *"$CR") _t=${_t%?} ;;
+            *) break ;;
+        esac
+    done
+    printf '%s' "$_t"
+}
+
+# _kv_get <file> <key>; prints the value, exits 1 if the key is absent.
+_kv_get() {
+    _kvf=$1
+    _kvk=$2
+    [ -f "$_kvf" ] || return 1
+    _kvv=
+    _kvfound=
+    # The `|| [ -n "$_line" ]` keeps a final line with no trailing newline.
+    while IFS= read -r _line || [ -n "$_line" ]; do
+        _line=$(_trim "$_line")
+        case $_line in
+            '' | '#'*) continue ;;
+            *=*) : ;;
+            *) continue ;;
+        esac
+        _k=$(_trim "${_line%%=*}")
+        [ "$_k" = "$_kvk" ] || continue
+        _kvv=$(_trim "${_line#*=}")
+        _kvfound=1
+    done <"$_kvf"
+    [ -n "$_kvfound" ] || return 1
+    printf '%s' "$_kvv"
+}
+
+# _kv_set <file> <key> <value>; rewrites one key in place, preserving every
+# other line, comment and the key order. Appends the key if it is absent.
+_kv_set() {
+    _kvf=$1
+    _kvk=$2
+    _kvnew=$3
+    _kvtmp=$_kvf.zenv.$$
+    _kvseen=
+    if [ -f "$_kvf" ]; then
+        while IFS= read -r _line || [ -n "$_line" ]; do
+            _bare=$(_trim "$_line")
+            case $_bare in
+                '' | '#'*)
+                    printf '%s\n' "$_line"
+                    continue
+                    ;;
+                *=*) : ;;
+                *)
+                    printf '%s\n' "$_line"
+                    continue
+                    ;;
+            esac
+            _k=$(_trim "${_bare%%=*}")
+            if [ "$_k" = "$_kvk" ]; then
+                printf '%s=%s\n' "$_kvk" "$_kvnew"
+                _kvseen=1
+            else
+                printf '%s\n' "$_line"
+            fi
+        done <"$_kvf" >"$_kvtmp"
+    else
+        : >"$_kvtmp"
+    fi
+    if [ -z "$_kvseen" ]; then
+        printf '%s=%s\n' "$_kvk" "$_kvnew" >>"$_kvtmp"
+    fi
+    mv -f "$_kvtmp" "$_kvf"
+}
+
+# Single-quote a value for safe inclusion in emitted shell code. Everything zenv
+# writes to stdout for `eval` goes through this, so a path containing a space, a
+# quote or a '$' is inert rather than re-parsed.
+#
+# Done with parameter expansion rather than `sed`, and not for speed: `zenv shell
+# activate` must work in a shell whose PATH is empty or broken, which is one of
+# the states a user most needs to fix. Nothing on the activation path forks.
+_shq() {
+    _sqv=$1
+    printf "'"
+    while :; do
+        case $_sqv in
+            *\'*)
+                printf "%s'\\\\''" "${_sqv%%\'*}"
+                _sqv=${_sqv#*\'}
+                ;;
+            *) break ;;
+        esac
+    done
+    printf "%s'" "$_sqv"
+}
+
+# _ini_get <file> <key>; the last `key = value` line's value, trimmed. Enough for
+# zkg's config, which has unique keys across its sections.
+_ini_get() {
+    _inif=$1
+    _inik=$2
+    [ -f "$_inif" ] || return 1
+    _iniv=
+    _inifound=
+    while IFS= read -r _line || [ -n "$_line" ]; do
+        _line=$(_trim "$_line")
+        case $_line in
+            '' | '#'* | ';'* | '['*) continue ;;
+            *=*) : ;;
+            *) continue ;;
+        esac
+        _k=$(_trim "${_line%%=*}")
+        [ "$_k" = "$_inik" ] || continue
+        _iniv=$(_trim "${_line#*=}")
+        _inifound=1
+    done <"$_inif"
+    [ -n "$_inifound" ] || return 1
+    printf '%s' "$_iniv"
+}
+
+# _ini_has <file> <section> <key>; true when the key is present in that section.
+# Section-aware where _ini_get is not, because writing has to know whether it is
+# replacing a line or adding one.
+_ini_has() {
+    [ -f "$1" ] || return 1
+    _ihs=
+    while IFS= read -r _line || [ -n "$_line" ]; do
+        _line=$(_trim "$_line")
+        case $_line in
+            '['*']')
+                _ihs=${_line#[}
+                _ihs=${_ihs%]}
+                continue
+                ;;
+            '' | '#'* | ';'*) continue ;;
+            *=*) : ;;
+            *) continue ;;
+        esac
+        [ "$_ihs" = "$2" ] || continue
+        [ "$(_trim "${_line%%=*}")" = "$3" ] || continue
+        return 0
+    done <"$1"
+    return 1
+}
+
+# _ini_set <file> <section> <key> <value>; rewrites one key in place.
+#
+# Every other line survives byte for byte -- comments, blank lines, key order,
+# [sources] and [templates] included -- so rewriting an existing key is a
+# one-line diff, which is what tests/test_autoconfig.sh asserts. A key that is
+# absent is inserted directly under its section header (not at the section's end,
+# where trailing blank lines would swallow it); a section that is absent is
+# appended.
+_ini_set() {
+    _isf=$1
+    _iss=$2
+    _isk=$3
+    _isv=$4
+    _istmp=$_isf.zenv.$$
+    _isrepl=
+    _ini_has "$_isf" "$_iss" "$_isk" && _isrepl=1
+    _issec=
+    _isdone=
+    if [ -f "$_isf" ]; then
+        while IFS= read -r _line || [ -n "$_line" ]; do
+            _bare=$(_trim "$_line")
+            case $_bare in
+                '['*']')
+                    printf '%s\n' "$_line"
+                    _issec=${_bare#[}
+                    _issec=${_issec%]}
+                    # Insertion goes here, right under the header, and only when
+                    # the pre-scan established the key is not already somewhere
+                    # in this section.
+                    if [ -z "$_isrepl" ] && [ -z "$_isdone" ] \
+                        && [ "$_issec" = "$_iss" ]; then
+                        printf '%s = %s\n' "$_isk" "$_isv"
+                        _isdone=1
+                    fi
+                    continue
+                    ;;
+                '' | '#'* | ';'*)
+                    printf '%s\n' "$_line"
+                    continue
+                    ;;
+                *=*) : ;;
+                *)
+                    printf '%s\n' "$_line"
+                    continue
+                    ;;
+            esac
+            if [ -n "$_isrepl" ] && [ "$_issec" = "$_iss" ] \
+                && [ "$(_trim "${_bare%%=*}")" = "$_isk" ]; then
+                printf '%s = %s\n' "$_isk" "$_isv"
+                _isdone=1
+            else
+                printf '%s\n' "$_line"
+            fi
+        done <"$_isf" >"$_istmp"
+    else
+        : >"$_istmp"
+    fi
+    if [ -z "$_isdone" ]; then
+        {
+            printf '[%s]\n' "$_iss"
+            printf '%s = %s\n' "$_isk" "$_isv"
+        } >>"$_istmp"
+    fi
+    mv -f "$_istmp" "$_isf" || _die "cannot rewrite $_isf"
+}
+
+# ---------------------------------------------------------------------------
+# zkg's manifest.json
+#
+# Edited through python3's json module, never with sed. python3 is already a hard
+# dependency of zkg itself, and hand-rolled JSON editing in sh is how state gets
+# silently corrupted. The three path keys sit at the top level of the object;
+# everything else -- installed_packages, manifest_version, unicode, nesting --
+# is round-tripped untouched.
+#
+# The manifest's script_dir and plugin_dir carry a "/packages" suffix the config's
+# do not (zeekpkg/manager.py:283-286), and its bin_dir does not -- which is why
+# _ac_manifest_agrees compares against values derived from zeek-config rather than
+# against the config's own.
+# ---------------------------------------------------------------------------
+
+_python() {
+    if [ -n "${ZENV_PYTHON:-}" ]; then
+        printf '%s' "$ZENV_PYTHON"
+        return 0
+    fi
+    for _py in python3 python; do
+        if command -v "$_py" >/dev/null 2>&1; then
+            printf '%s' "$_py"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# _manifest_get <file> <key>; prints the value, or nothing when absent.
+_manifest_get() {
+    _mgpy=$(_python) || _die "python3 is required to read $1 (it is also a zkg dependency)"
+    "$_mgpy" -c '
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+except Exception as e:
+    sys.stderr.write("zenv: cannot read %s: %s\n" % (sys.argv[1], e))
+    sys.exit(1)
+v = d.get(sys.argv[2], "")
+sys.stdout.write("" if v is None else str(v))
+' "$1" "$2"
+}
+
+# _manifest_count <file>; how many packages the manifest records as installed.
+# Fails rather than printing a wrong number when there is no manifest, no python,
+# or the file is not readable JSON -- `zenv list` shows '-' in that case.
+_manifest_count() {
+    [ -f "$1" ] || return 1
+    _mcpy=$(_python) || return 1
+    "$_mcpy" -c '
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+except Exception:
+    sys.exit(1)
+p = d.get("installed_packages")
+if not isinstance(p, (list, dict)):
+    sys.exit(1)
+sys.stdout.write(str(len(p)))
+' "$1"
+}
+
+# _manifest_set <file> <script_dir> <plugin_dir> <bin_dir>; rewrites exactly
+# those three keys and nothing else.
+_manifest_set() {
+    _mspy=$(_python) || _die "python3 is required to rewrite $1 (it is also a zkg dependency)"
+    "$_mspy" -c '
+import json, os, sys
+path, script_dir, plugin_dir, bin_dir = sys.argv[1:5]
+with open(path) as f:
+    d = json.load(f)
+d["script_dir"] = script_dir
+d["plugin_dir"] = plugin_dir
+d["bin_dir"] = bin_dir
+tmp = path + ".zenv.tmp"
+with open(tmp, "w") as f:
+    json.dump(d, f, indent=4, sort_keys=True)
+    f.write("\n")
+os.replace(tmp, path)
+' "$1" "$2" "$3" "$4" || _die "cannot rewrite $1"
+}
+
+_config_file() {
+    _zenv_root
+    printf '%s' "$ZENV_ROOT_RESOLVED/config"
+}
+
+_config_get() { _kv_get "$(_config_file)" "$1"; }
+
+# ---------------------------------------------------------------------------
+# Env names and metadata
+# ---------------------------------------------------------------------------
+
+_valid_name() {
+    case ${1:-} in
+        '') return 1 ;;
+        config) return 1 ;;  # reserved: it sits beside the env dirs in the root
+    esac
+    case $1 in
+        [!$_N_FIRST]*) return 1 ;;
+    esac
+    case $1 in
+        *[!$_N_REST]*) return 1 ;;
+    esac
+    return 0
+}
+
+_check_name() {
+    if _valid_name "${1:-}"; then
+        return 0
+    fi
+    case ${1:-} in
+        '') _die "an environment name is required" ;;
+        config) _die "'config' is reserved: it is the root's own metadata file" ;;
+    esac
+    _die "invalid environment name '$1': must start with a letter or digit and
+      contain only letters, digits, '.', '_' and '-'"
+}
+
+_env_dir() {
+    _zenv_root
+    printf '%s' "$ZENV_ROOT_RESOLVED/$1"
+}
+
+_env_file() { printf '%s' "$(_env_dir "$1")/env"; }
+
+# An env exists if its metadata file does. A bare directory in the root is not
+# an env, so a stray file or a half-made directory is skipped, not fatal.
+_env_exists() { [ -f "$(_env_file "$1")" ]; }
+
+_require_env() {
+    _check_name "${1:-}"
+    if ! _env_exists "$1"; then
+        _zenv_root
+        _die "no such environment: $1 (looked for $ZENV_ROOT_RESOLVED/$1/env)
+      'zenv list' shows what exists; 'zenv new $1' creates it"
+    fi
+}
+
+# Read a key from an env's metadata, falling back to the layout default so an
+# env file that predates a key still works.
+_env_get() {
+    _egname=$1
+    _egkey=$2
+    if _egv=$(_kv_get "$(_env_file "$_egname")" "$_egkey"); then
+        if [ -n "$_egv" ]; then
+            printf '%s' "$_egv"
+            return 0
+        fi
+    fi
+    case $_egkey in
+        name) printf '%s' "$_egname" ;;
+        prefix) printf '%s' "$(_env_dir "$_egname")/zeek" ;;
+        zkg_dir) printf '%s' "$(_env_dir "$_egname")/zkg" ;;
+        # Empty, not an error: an environment `zenv new` created was adopted from
+        # nothing, and `zenv restore` has to be able to ask without failing.
+        adopted) : ;;
+        *) return 1 ;;
+    esac
+}
+
+# The env a command applies to: an explicit argument, else the active one.
+_target_env() {
+    if [ -n "${1:-}" ]; then
+        _require_env "$1"
+        printf '%s' "$1"
+        return 0
+    fi
+    if [ -n "${ZENV:-}" ]; then
+        _require_env "$ZENV"
+        printf '%s' "$ZENV"
+        return 0
+    fi
+    _die "no environment given and none is active
+      pass a name, or run 'zenv activate <name>' first"
+}
+
+# Every env with metadata, one per line, in sorted order. Anything else in the
+# root -- the config file, a stray file, a directory with no env -- is skipped.
+_each_env() {
+    _zenv_root
+    [ -d "$ZENV_ROOT_RESOLVED" ] || return 0
+    for _d in "$ZENV_ROOT_RESOLVED"/*; do
+        [ -d "$_d" ] || continue
+        [ -f "$_d/env" ] || continue
+        _n=${_d##*/}
+        _valid_name "$_n" || continue
+        printf '%s\n' "$_n"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Search-path surgery
+#
+# PATH, PYTHONPATH and MANPATH are edited component by component, never with
+# sed: a root containing '.', '+', '*' or '[' would otherwise be read as a
+# regular expression. An empty component means "the current directory", so it is
+# preserved exactly where it was rather than dropped or turned into '.'.
+#
+# Directory lists are newline-separated (see NL) and are expected to arrive
+# already free of trailing slashes.
+# ---------------------------------------------------------------------------
+
+# Strip trailing slashes without forking, for use inside the per-component loops.
+# Sets _nrm.
+_normslash() {
+    _nrm=$1
+    while :; do
+        case $_nrm in
+            /) break ;;
+            */) _nrm=${_nrm%/} ;;
+            *) break ;;
+        esac
+    done
+}
+
+# _path_strip <value> <dirs>
+# Print <value> with every component naming one of <dirs> removed. Comparison is
+# on trailing-slash-normalised paths, so '<dir>/' matches '<dir>'. All
+# occurrences go, and the order of the survivors is unchanged.
+_path_strip() {
+    _psv=$1
+    _psdirs=$2
+    [ -n "$_psv" ] || return 0
+    _psout=
+    _psfirst=1
+    _psrest=$_psv
+    while :; do
+        case $_psrest in
+            *:*)
+                _pscomp=${_psrest%%:*}
+                _psrest=${_psrest#*:}
+                _pslast=
+                ;;
+            *)
+                _pscomp=$_psrest
+                _psrest=
+                _pslast=1
+                ;;
+        esac
+
+        _pskeep=1
+        if [ -n "$_pscomp" ]; then
+            _normslash "$_pscomp"
+            _pscn=$_nrm
+            _psdrest=$_psdirs
+            while [ -n "$_psdrest" ]; do
+                case $_psdrest in
+                    *"$NL"*)
+                        _psd=${_psdrest%%"$NL"*}
+                        _psdrest=${_psdrest#*"$NL"}
+                        ;;
+                    *)
+                        _psd=$_psdrest
+                        _psdrest=
+                        ;;
+                esac
+                [ -n "$_psd" ] || continue
+                if [ "$_pscn" = "$_psd" ]; then
+                    _pskeep=
+                    break
+                fi
+            done
+        fi
+
+        if [ -n "$_pskeep" ]; then
+            if [ -n "$_psfirst" ]; then
+                _psout=$_pscomp
+                _psfirst=
+            else
+                _psout=$_psout:$_pscomp
+            fi
+        fi
+
+        [ -z "$_pslast" ] || break
+    done
+    printf '%s' "$_psout"
+}
+
+# True when a value holds nothing but empty components ('', ':', '::'). Used by
+# deactivate to tell "back to how it was" from "the user added something".
+_all_empty() {
+    case $1 in
+        *[!:]*) return 1 ;;
+    esac
+    return 0
+}
+
+# Join a newline-separated list into a colon-separated one, dropping empty
+# entries and repeats. First appearance wins, so precedence is preserved.
+_join_uniq() {
+    _juout=
+    _jurest=$1
+    while [ -n "$_jurest" ]; do
+        case $_jurest in
+            *"$NL"*)
+                _ju=${_jurest%%"$NL"*}
+                _jurest=${_jurest#*"$NL"}
+                ;;
+            *)
+                _ju=$_jurest
+                _jurest=
+                ;;
+        esac
+        [ -n "$_ju" ] || continue
+        case ":$_juout:" in
+            *":$_ju:"*) continue ;;
+        esac
+        if [ -z "$_juout" ]; then
+            _juout=$_ju
+        else
+            _juout=$_juout:$_ju
+        fi
+    done
+    printf '%s' "$_juout"
+}
+
+# Split a colon-separated value into a newline-separated list, dropping empties.
+_colon_to_lines() {
+    _ctrest=$1
+    while [ -n "$_ctrest" ]; do
+        case $_ctrest in
+            *:*)
+                _ct=${_ctrest%%:*}
+                _ctrest=${_ctrest#*:}
+                ;;
+            *)
+                _ct=$_ctrest
+                _ctrest=
+                ;;
+        esac
+        [ -n "$_ct" ] || continue
+        printf '%s\n' "$_ct"
+    done
+}
+
+# Drop repeated lines from a newline-separated list, keeping the first of each.
+# Not `sort -u`: order is meaningful and a fork per call is not worth it.
+_uniq_lines() {
+    _ulout=
+    _ulrest=$1
+    while [ -n "$_ulrest" ]; do
+        case $_ulrest in
+            *"$NL"*)
+                _ul=${_ulrest%%"$NL"*}
+                _ulrest=${_ulrest#*"$NL"}
+                ;;
+            *)
+                _ul=$_ulrest
+                _ulrest=
+                ;;
+        esac
+        [ -n "$_ul" ] || continue
+        case "$NL$_ulout" in
+            *"$NL$_ul$NL"*) continue ;;
+        esac
+        _ulout=$_ulout$_ul$NL
+    done
+    printf '%s' "$_ulout"
+}
+
+# Every prefix zenv may ever have prepended to a search path, one per line:
+# each registered environment's, plus the active one -- which may name an
+# environment that has since been removed, and whose components still need
+# stripping. Resolved physically, since that is the form activate emitted.
+_all_prefixes() {
+    _uniq_lines "$(_all_prefixes_raw)"
+}
+
+_all_prefixes_raw() {
+    _zenv_root
+    _each_env | while IFS= read -r _apn; do
+        [ -n "$_apn" ] || continue
+        _app=$(_env_get "$_apn" prefix)
+        [ -n "$_app" ] || continue
+        _apr=$(_realpath "$_app") || _apr=$_app
+        printf '%s\n' "${_apr:-$_app}"
+    done
+    if [ -n "${ZENV_PREFIX:-}" ]; then
+        _apr=$(_realpath "$ZENV_PREFIX") || _apr=$ZENV_PREFIX
+        printf '%s\n' "${_apr:-$ZENV_PREFIX}"
+    fi
+}
+
+# The directories to strip from PATH, PYTHONPATH and MANPATH, given a
+# newline-separated list of prefixes. Removal is enumerated from real
+# environments rather than pattern-matched, so an unrelated '.../zeek/bin' that
+# no environment owns is never touched.
+_strip_dirs() {
+    _sdrest=$1
+    _sdsub=$2
+    while [ -n "$_sdrest" ]; do
+        case $_sdrest in
+            *"$NL"*)
+                _sd=${_sdrest%%"$NL"*}
+                _sdrest=${_sdrest#*"$NL"}
+                ;;
+            *)
+                _sd=$_sdrest
+                _sdrest=
+                ;;
+        esac
+        [ -n "$_sd" ] || continue
+        _normslash "$_sd/$_sdsub"
+        printf '%s\n' "$_nrm"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_version() { printf '%s\n' "$ZENV_VERSION"; }
+
+cmd_root() {
+    _mode=path
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --source) _mode=source ;;
+            *) _die "root: unexpected argument '$1'" ;;
+        esac
+        shift
+    done
+    _zenv_root
+    if [ "$_mode" = source ]; then
+        printf '%s\n' "$ZENV_ROOT_SOURCE"
+        return 0
+    fi
+    # The path alone on stdout, so `cd "$(zenv root)"` works; the provenance on
+    # stderr, so a surprising root is still one command to diagnose.
+    printf '%s\n' "$ZENV_ROOT_RESOLVED"
+    _say "  (from $ZENV_ROOT_SOURCE)"
+}
+
+# Print a path physically resolved, falling back to the literal value if it
+# cannot be resolved -- printing something wrong is better than printing an
+# empty line that a caller would splice into a command line.
+_print_path() {
+    _pp=$1
+    _ppr=$(_realpath "$_pp") || _ppr=$_pp
+    [ -n "$_ppr" ] || _ppr=$_pp
+    printf '%s\n' "$_ppr"
+}
+
+cmd_prefix() {
+    _n=$(_target_env "${1:-}") || exit 1
+    _print_path "$(_env_get "$_n" prefix)"
+}
+
+cmd_zkgdir() {
+    _n=$(_target_env "${1:-}") || exit 1
+    _print_path "$(_env_get "$_n" zkg_dir)"
+}
+
+cmd_new() {
+    _name=
+    _src=
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --src)
+                [ $# -ge 2 ] || _die "new: --src needs a directory"
+                _src=$2
+                shift
+                ;;
+            --src=*) _src=${1#--src=} ;;
+            -*) _die "new: unknown option '$1'" ;;
+            *)
+                [ -z "$_name" ] || _die "new: only one name, got '$_name' and '$1'"
+                _name=$1
+                ;;
+        esac
+        shift
+    done
+
+    _check_name "$_name"
+    _zenv_root
+    _dir=$ZENV_ROOT_RESOLVED/$_name
+
+    if [ -n "$_src" ]; then
+        case $_src in
+            /*) : ;;
+            *) _die "new: --src must be an absolute path, got '$_src'" ;;
+        esac
+        [ -d "$_src" ] || _die "new: --src is not a directory: $_src"
+        _src=$(_realpath "$_src")
+    fi
+
+    mkdir -p "$ZENV_ROOT_RESOLVED" \
+        || _die "cannot create the root: $ZENV_ROOT_RESOLVED"
+    _resolve_root_after_mkdir
+    _dir=$ZENV_ROOT_RESOLVED/$_name
+
+    # Plain mkdir, not -p: existence must be detected atomically so two
+    # concurrent `zenv new a` leave one winner and one clear error.
+    if ! mkdir "$_dir" 2>/dev/null; then
+        if [ -f "$_dir/env" ]; then
+            _die "environment '$_name' already exists at $_dir"
+        fi
+        if [ -e "$_dir" ] || [ -L "$_dir" ]; then
+            _die "$_dir already exists but is not a zenv environment
+      remove it by hand, or pick another name"
+        fi
+        _die "cannot create $_dir"
+    fi
+
+    _prefix=$_dir/zeek
+    _zkgdir=$_dir/zkg
+    # Metadata lives beside the prefix, never inside it, so `make install` can
+    # never collide with it and `rm -rf` on the env removes both together.
+    mkdir -p "$_prefix" "$_zkgdir" || _die "cannot populate $_dir"
+
+    _write_env_meta "$_name" "$_dir/env" "$_prefix" "$_zkgdir" "$_src"
+
+    _write_activate_stub "$_name" "$_dir/activate"
+
+    # stdout: the prefix, so `zenv new dev >/dev/null` still scripts cleanly and
+    # `p=$(zenv new dev)` is usable. Everything else is guidance, on stderr.
+    printf '%s\n' "$_prefix"
+    _say "created environment '$_name' at $_dir"
+    _say "  prefix:  $_prefix   (empty -- install Zeek here yourself)"
+    _say "  zkg dir: $_zkgdir   (empty -- 'zenv autoconfig $_name' fills it)"
+    _say ""
+    _say "zenv does not build Zeek. Next:"
+    _say "  1. build and install into that prefix, however you normally do:"
+    _say "       ./configure --prefix=\"\$(zenv prefix $_name)\""
+    _say "       cd build && make -j && make install"
+    _say "  2. zenv autoconfig $_name     wire zkg to the install"
+    _say "  3. zenv activate $_name       use it in this shell"
+}
+
+# The source-able stub, the direct analogue of a venv's bin/activate. Names are
+# validated, so single-quoting the name here is safe.
+# _write_env_meta <name> <file> <prefix> <zkg dir> <src> [adopted]. One writer
+# for the metadata file, shared by `new` and `adopt`, so an adopted environment
+# is byte-for-byte the same kind of thing as a created one.
+#
+# `adopted` is moved, linked, or empty for an environment created from nothing.
+# It is what makes `zenv restore` the exact inverse of `zenv adopt --move` and
+# nothing else: only a moved install has somewhere to be moved back to, and
+# guessing from the symlinks alone would let `zenv uninstall` relocate an install
+# you built yourself just because `zenv link` pointed ~/zeek at it.
+_write_env_meta() {
+    {
+        printf '# zenv environment metadata. Edited by zenv; safe to read.\n'
+        printf 'name=%s\n' "$1"
+        printf 'prefix=%s\n' "$3"
+        printf 'zkg_dir=%s\n' "$4"
+        printf 'src=%s\n' "$5"
+        # Filled in by `zenv autoconfig` the first time the source tree verifies
+        # against the install, and read back by activation so a shared checkout
+        # that has moved on can be named rather than merely noticed.
+        printf 'src_commit=\n'
+        printf 'src_version=\n'
+        printf 'adopted=%s\n' "${6:-}"
+        printf 'created=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo unknown)"
+    } >"$2" || _die "cannot write $2"
+}
+
+_write_activate_stub() {
+    _asn=$1
+    _asf=$2
+    {
+        printf '# zenv activation stub for %s.\n' "$_asn"
+        printf '# Source this from any POSIX shell: . %s\n' "$_asf"
+        printf '# Equivalent to `zenv activate %s` once `zenv init` is set up.\n' "$_asn"
+        printf '_zenv_stub_out=$(command zenv shell activate %s) || return 2>/dev/null || exit 1\n' \
+            "'$_asn'"
+        printf 'eval "$_zenv_stub_out"\n'
+        printf 'unset _zenv_stub_out\n'
+    } >"$_asf" || _die "cannot write $_asf"
+}
+
+cmd_list() {
+    _names_only=
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --names) _names_only=1 ;;
+            -*) _die "list: unknown option '$1'" ;;
+            *) _die "list: unexpected argument '$1'" ;;
+        esac
+        shift
+    done
+
+    _zenv_root
+    _envs=$(_each_env)
+
+    if [ -n "$_names_only" ]; then
+        [ -n "$_envs" ] && printf '%s\n' "$_envs"
+        return 0
+    fi
+
+    if [ -z "$_envs" ]; then
+        _say "no environments in $ZENV_ROOT_RESOLVED"
+        _say "  'zenv new <name>' creates one"
+        return 0
+    fi
+
+    _zeek_link=$(_config_get zeek_link || true)
+    _linked_prefix=
+    if [ -n "$_zeek_link" ] && [ -L "$_zeek_link" ]; then
+        _linked_prefix=$(_realpath "$_zeek_link")
+    fi
+
+    printf '%-16s %-16s %-10s %-5s %-7s %s\n' \
+        NAME VERSION INSTALLED PKGS LINKED ACTIVE
+    printf '%s\n' "$_envs" | while IFS= read -r _n; do
+        [ -n "$_n" ] || continue
+        _p=$(_env_get "$_n" prefix)
+        _zc=$_p/bin/zeek-config
+
+        if [ -x "$_zc" ]; then
+            _inst=yes
+            _ver=$("$_zc" --version 2>/dev/null) || _ver='?'
+            [ -n "$_ver" ] || _ver='?'
+        else
+            _inst=no
+            _ver=-
+        fi
+
+        _link=no
+        if [ -n "$_linked_prefix" ] && [ "$_linked_prefix" = "$(_realpath "$_p")" ]; then
+            _link=yes
+        fi
+
+        _act=no
+        [ "${ZENV:-}" = "$_n" ] && _act=yes
+
+        # The count comes from the env's own manifest, so it is right even for an
+        # env that is not active and needs no zkg process to read.
+        _pkgs=$(_manifest_count "$(_env_get "$_n" zkg_dir)/manifest.json") || _pkgs=-
+        [ -n "$_pkgs" ] || _pkgs=-
+
+        printf '%-16s %-16s %-10s %-5s %-7s %s\n' \
+            "$_n" "$_ver" "$_inst" "$_pkgs" "$_link" "$_act"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Source trees
+#
+# The zkg config's zeek_dist is the one place that name genuinely does something:
+# it is the %(zeek_dist)s substitution which two of the 285 index packages pass
+# to their own ./configure --zeek-dist=. A stale value builds a plugin against
+# the wrong sources, which then either fails at dlopen on the version-guard
+# symbol or links a subtly different ABI -- so zenv writes the key only when it
+# can prove the tree matches the install, and writes it *empty* otherwise. Empty
+# breaks those two packages immediately and loudly; stale breaks them silently.
+#
+# zenv never sets ZEEK_DIST in the environment: nothing reads it from there.
+#
+# _dist_state <tree> <installed version> sets:
+#   _DIST_STATE  verified | drifted | unbuilt | gone | none
+#   _DIST_WHY    one line naming the check that decided it
+# Only 'drifted' is a problem; the other four are normal states.
+# ---------------------------------------------------------------------------
+
+# A version as it is spelled in the guard symbol: 9.1.0-dev.75 -> 9_1_0_dev_75.
+# Character by character rather than with `tr`, to keep the helpers fork-free.
+_mangle_version() {
+    _mvin=$1
+    _mvout=
+    while [ -n "$_mvin" ]; do
+        _mvc=${_mvin%"${_mvin#?}"}
+        _mvin=${_mvin#?}
+        case $_mvc in
+            . | -) _mvout=${_mvout}_ ;;
+            *) _mvout=$_mvout$_mvc ;;
+        esac
+    done
+    printf '%s' "$_mvout"
+}
+
+_dist_state() {
+    _dst=$1
+    _dsver=$2
+    if [ -z "$_dst" ]; then
+        _DIST_STATE=none
+        _DIST_WHY='no source tree recorded (normal for a binary-packaged Zeek)'
+        return 0
+    fi
+    if [ ! -d "$_dst" ]; then
+        _DIST_STATE=gone
+        _DIST_WHY="the tree is not there any more: $_dst"
+        return 0
+    fi
+    if [ ! -f "$_dst/VERSION" ]; then
+        _DIST_STATE=drifted
+        _DIST_WHY="$_dst has no VERSION file, so it cannot be matched to the install"
+        return 0
+    fi
+    _dstv=
+    IFS= read -r _dstv <"$_dst/VERSION" 2>/dev/null || :
+    _dstv=$(_trim "$_dstv")
+    if [ "$_dstv" != "$_dsver" ]; then
+        _DIST_STATE=drifted
+        _DIST_WHY="$_dst/VERSION is '$_dstv', the install is '$_dsver'"
+        return 0
+    fi
+    # The install's own version matching is not enough: the tree may have been
+    # rebuilt for another prefix since. The guard symbol encodes version *and*
+    # plugin API version, and is the same check a real dlopen would apply.
+    if [ ! -f "$_dst/build/zeek-version.h" ]; then
+        _DIST_STATE=unbuilt
+        _DIST_WHY="$_dst/build/zeek-version.h is missing (a --builddir build, or never built)"
+        return 0
+    fi
+    # Any line carrying the symbol will do, and it has to be any line: the real
+    # header names ZEEK_VERSION_FUNCTION twice -- once in the #define that spells
+    # the symbol out, and again in the `extern const char* ZEEK_VERSION_FUNCTION();`
+    # declaration four lines below it. Keeping the last such line finds the
+    # declaration, which carries no version, and calls every correct install
+    # drifted.
+    _dsym=zeek_version_$(_mangle_version "$_dsver")_plugin
+    _dsfound=0
+    while IFS= read -r _line || [ -n "$_line" ]; do
+        case $_line in
+            *"$_dsym"*) _dsfound=1 ;;
+        esac
+    done <"$_dst/build/zeek-version.h"
+    if [ "$_dsfound" = 1 ]; then
+        _DIST_STATE=verified
+        _DIST_WHY="VERSION and build/zeek-version.h both match $_dsver"
+    else
+        _DIST_STATE=drifted
+        _DIST_WHY="$_dst/build was built for a different version than $_dsver"
+    fi
+}
+
+# The tree an env asserts it was built from: its own `src` override, else what
+# the install itself reports. Sets _DIST_TREE.
+_dist_tree() {
+    _dtsrc=$(_env_get "$1" src) || _dtsrc=
+    if [ -n "$_dtsrc" ]; then
+        _DIST_TREE=$_dtsrc
+    else
+        _DIST_TREE=$2
+    fi
+}
+
+# The first 12 characters of a commit, which is what a human compares. A builtin
+# printf, so this costs no fork.
+_short_sha() { printf '%.12s' "$1"; }
+
+# The commit a source tree is on right now. Sets _DIST_HEAD to the full sha and
+# _DIST_DESC to a readable name for it; both empty when the tree is not a git
+# checkout, which is the normal state of a release tarball and not a fault.
+#
+# Requiring <tree>/.git rather than letting git search upwards is deliberate: a
+# source tree that merely *sits inside* another repository would otherwise be
+# reported as being on that repository's commit, and zenv would go on to name a
+# commit the tree has never heard of.
+_dist_commit() {
+    _dct=$1
+    _DIST_HEAD=
+    _DIST_DESC=
+    [ -n "$_dct" ] && [ -e "$_dct/.git" ] || return 0
+    command -v git >/dev/null 2>&1 || return 0
+    _DIST_HEAD=$(git -C "$_dct" rev-parse HEAD 2>/dev/null) || _DIST_HEAD=
+    [ -n "$_DIST_HEAD" ] || return 0
+    _DIST_DESC=$(git -C "$_dct" describe --tags --always --dirty 2>/dev/null) \
+        || _DIST_DESC=
+}
+
+# Is <sha> a commit this tree actually has? Guards against naming a commit that
+# came from a different checkout -- `src` can be re-pointed by hand, and a shared
+# tree can be re-cloned.
+_dist_has_commit() {
+    [ -n "$2" ] || return 1
+    command -v git >/dev/null 2>&1 || return 1
+    git -C "$1" cat-file -e "$2^{commit}" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# The shared-source-tree reminder
+#
+# One checkout serving several environments is the normal way to work, and it is
+# the one hazard zenv cannot fix for you: activating an environment does not
+# check its tree back out. A package built with --zeek-dist after a `git
+# checkout` compiles against sources the active install was never built from,
+# and the version guard then refuses the plugin at dlopen (finding 5).
+#
+# zenv already refuses to write a stale zeek_dist, so that build fails loudly
+# rather than silently. But "empty" does not tell you *what* to check out again.
+# So `zenv autoconfig` records the commit the tree was on at the moment it
+# verified -- along with the installed version it verified against, since a
+# commit recorded for a different version is no longer evidence about this
+# install -- and activation reads them back.
+#
+# _dist_reminder <name> <prefix> sets:
+#   _REMIND        the lines to print, empty when there is nothing to say
+#   _REMIND_STATE  none | ok | unbuilt | checkout | unknown-commit | drifted
+_dist_reminder() {
+    _drn=$1
+    _drp=$2
+    _REMIND=
+    _REMIND_STATE=none
+
+    _drzc=$_drp/bin/zeek-config
+    [ -x "$_drzc" ] || return 0
+    _drver=$("$_drzc" --version 2>/dev/null) || _drver=
+    _drdist=$("$_drzc" --zeek_dist 2>/dev/null) || _drdist=
+    _dist_tree "$_drn" "$_drdist"
+    _drtree=$_DIST_TREE
+    # No tree, or a tree that is not there any more: nothing to check out, and
+    # `zenv doctor` already reports both as information rather than a fault.
+    [ -n "$_drtree" ] && [ -d "$_drtree" ] || return 0
+
+    _dist_state "$_drtree" "$_drver"
+    case $_DIST_STATE in
+        verified)
+            _REMIND_STATE=ok
+            return 0
+            ;;
+        drifted) : ;;
+        *)
+            # unbuilt: a --builddir build, which cannot be checked this way.
+            _REMIND_STATE=$_DIST_STATE
+            return 0
+            ;;
+    esac
+    _drwhy=$_DIST_WHY
+
+    _drwant=$(_env_get "$_drn" src_commit 2>/dev/null) || _drwant=
+    _drwantver=$(_env_get "$_drn" src_version 2>/dev/null) || _drwantver=
+    _dist_commit "$_drtree"
+
+    # The recorded commit is evidence about *this* install only while the
+    # installed version is still the one it was recorded against. Reinstall from
+    # a different version and it becomes a fact about the old install, so the
+    # fallback below reports the drift without naming a commit to return to.
+    if [ -n "$_drwant" ] && [ -n "$_DIST_HEAD" ] \
+        && [ "$_drwantver" = "$_drver" ] && [ "$_drwant" != "$_DIST_HEAD" ]; then
+        if _dist_has_commit "$_drtree" "$_drwant"; then
+            _REMIND_STATE=checkout
+            _REMIND="'$_drn' was built from $_drtree at $(_short_sha "$_drwant")
+      that tree is now on $(_short_sha "$_DIST_HEAD")${_DIST_DESC:+ ($_DIST_DESC)}
+      git -C $_drtree checkout $_drwant
+      puts it back. Only a package build that passes --zeek-dist reads that
+      tree; nothing else in this shell does."
+        else
+            _REMIND_STATE=unknown-commit
+            _REMIND="'$_drn' was built from $_drtree at $(_short_sha "$_drwant"),
+      a commit that tree does not have any more
+      fetch it, or rebuild and re-run 'zenv autoconfig $_drn' to record
+      whatever this install really came from"
+        fi
+        return 0
+    fi
+
+    _REMIND_STATE=drifted
+    _REMIND="'$_drn' and its source tree disagree: $_drwhy"
+    if [ -z "$_drwant" ] && [ -n "$_DIST_HEAD" ]; then
+        _REMIND="$_REMIND
+      no build commit is recorded for '$_drn', so zenv cannot name the one to
+      check out; run 'zenv autoconfig $_drn' while that tree matches and it will"
+    fi
+    _REMIND="$_REMIND
+      nothing in this shell reads that tree -- only a package build that passes
+      --zeek-dist does, and zenv keeps zeek_dist empty rather than let it"
+}
+
+# ---------------------------------------------------------------------------
+# autoconfig -- the post-`make install` step
+#
+# After you install into $(zenv prefix <name>), that install has no zkg wiring:
+# the bundled <prefix>/bin/zkg defaults into <prefix>/etc/zkg and
+# <prefix>/var/lib/zkg, and nothing points at the env's own zkg directory. This
+# is the one command that creates and validates <zkg_dir>/config so every later
+# zkg call in that env reads and writes only that env's state.
+#
+# The order of the steps is load-bearing, for two separate reasons:
+#
+#  - Merely *constructing* zkg's Manager relocates one state dir's package trees
+#    on top of another's and delete_path()es the destination when the config and
+#    the manifest disagree. zkg does that before dispatching any subcommand, so
+#    the safety gate has to be entirely inside zenv and no zkg process may exist
+#    until it passes.
+#  - zkg honours ZEEK_ZKG_CONFIG_DIR / ZEEK_ZKG_STATE_DIR only when the directory
+#    already exists, and silently falls back to ~/.zkg otherwise. So the state
+#    directory is created before zkg is invoked, never after.
+# ---------------------------------------------------------------------------
+
+# Resolve as far as the filesystem allows, else just normalise: a directory that
+# does not exist yet still has to be comparable.
+_resolve_soft() {
+    [ -n "$1" ] || return 0
+    if _rsv=$(_realpath "$1" 2>/dev/null) && [ -n "$_rsv" ]; then
+        printf '%s' "$_rsv"
+    else
+        _strip_slash "$1"
+    fi
+}
+
+# True when <path> is <dir> or lies under it.
+_under() {
+    case $1 in
+        "$2" | "$2"/*) return 0 ;;
+    esac
+    return 1
+}
+
+# The env whose prefix contains <path>, if any. Word splitting on the name list
+# is safe because names are validated to hold no whitespace.
+_owner_env() {
+    for _oen in $(_each_env); do
+        _oepfx=$(_realpath "$(_env_get "$_oen" prefix)") || continue
+        if _under "$1" "$_oepfx"; then
+            printf '%s' "$_oen"
+            return 0
+        fi
+    done
+    return 1
+}
+
+cmd_autoconfig() {
+    _name=
+    _fix=
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --fix-paths) _fix=1 ;;
+            -*) _die "autoconfig: unknown option '$1'" ;;
+            *)
+                [ -z "$_name" ] \
+                    || _die "autoconfig: only one name, got '$_name' and '$1'"
+                _name=$1
+                ;;
+        esac
+        shift
+    done
+    _name=$(_target_env "$_name")
+    _autoconfig "$_name" "$_fix"
+    printf '%s\n' "$_AC_CONFIG"
+}
+
+# _autoconfig <name> [fix-paths]. Sets _AC_CONFIG to the config file it wrote.
+# Every word it prints goes to stderr, because `zenv shell activate` calls this
+# while its own stdout is being collected for eval.
+_autoconfig() {
+    _acn=$1
+    _acfix=${2:-}
+
+    _acp=$(_env_get "$_acn" prefix)
+    _acp=$(_realpath "$_acp") || _die "cannot resolve the prefix of '$_acn'"
+    _acz=$(_env_get "$_acn" zkg_dir)
+    _acz=$(_realpath "$_acz") || _die "cannot resolve the zkg directory of '$_acn'"
+
+    # 1. Something must be installed there. zenv does not offer to build it.
+    _aczc=$_acp/bin/zeek-config
+    if [ ! -x "$_aczc" ]; then
+        _die "nothing installed at $_acp yet, so there is nothing to wire zkg to
+      install Zeek there yourself, however you normally do:
+        ./configure --prefix=\"\$(zenv prefix $_acn)\"
+      then run 'zenv autoconfig $_acn' again"
+    fi
+
+    _acsite=$("$_aczc" --site_dir 2>/dev/null) || _acsite=
+    _acplug=$("$_aczc" --plugin_dir 2>/dev/null) || _acplug=
+    _acpfx=$("$_aczc" --prefix 2>/dev/null) || _acpfx=
+    _acdist=$("$_aczc" --zeek_dist 2>/dev/null) || _acdist=
+    _acver=$("$_aczc" --version 2>/dev/null) || _acver=
+    [ -n "$_acsite" ] \
+        || _die "$_aczc --site_dir printed nothing; is that a Zeek install?"
+    [ -n "$_acplug" ] \
+        || _die "$_aczc --plugin_dir printed nothing; is that a Zeek install?"
+    [ -n "$_acpfx" ] || _acpfx=$_acp
+
+    # 2. The gate. Nothing below runs, and no zkg process is created, until the
+    #    install's own script and plugin directories are shown to live inside the
+    #    env's prefix. A prefix installed or copied through a symlink bakes the
+    #    *original* prefix, so zkg would be pointed at another env's directories
+    #    and would adopt them by deleting them.
+    _acsiter=$(_resolve_soft "$_acsite")
+    _acplugr=$(_resolve_soft "$_acplug")
+    _ac_gate "$_acn" "$_acp" script "$_acsiter"
+    _ac_gate "$_acn" "$_acp" plugin "$_acplugr"
+
+    #    Same refusal when another registered env's config already claims them.
+    for _acother in $(_each_env); do
+        [ "$_acother" = "$_acn" ] && continue
+        _acocfg=$(_env_get "$_acother" zkg_dir)/config
+        [ -f "$_acocfg" ] || continue
+        for _ackey in script_dir plugin_dir; do
+            _acov=$(_ini_get "$_acocfg" "$_ackey") || continue
+            [ -n "$_acov" ] || continue
+            _acov=$(_resolve_soft "$_acov")
+            case $_ackey in
+                script_dir) _acmine=$_acsiter ;;
+                *) _acmine=$_acplugr ;;
+            esac
+            [ "$_acov" = "$_acmine" ] || continue
+            _die "refusing to wire zkg for '$_acn': environment '$_acother' already
+      claims that $_ackey, and two configs naming one directory is what lets a
+      later zkg call move and delete the other's installed packages
+        $_ackey: $_acov
+      no zkg command was run"
+        done
+    done
+
+    # 3. The state directory, before any zkg invocation: the ZEEK_ZKG_* overrides
+    #    are ignored unless the directory already exists.
+    mkdir -p "$_acz" || _die "cannot create the zkg directory: $_acz"
+
+    # 4. The manifest, also before any zkg invocation.
+    _acman=$_acz/manifest.json
+    _acmwant_s=$_acsite/packages
+    _acmwant_p=$_acplug/packages
+    _acmwant_b=$_acpfx/bin
+    if [ -f "$_acman" ]; then
+        if ! _ac_manifest_agrees; then
+            if [ -z "$_acfix" ] && ! _ac_manifest_is_fresh_scaffold; then
+                _die "$_acman disagrees with what this install reports:
+$_AC_MANIFEST_DIFF
+      the next zkg call would 'fix' that by moving one onto the other and
+      deleting the destination, so nothing was run
+      pass --fix-paths to rewrite the manifest to match"
+            fi
+            _manifest_set "$_acman" "$_acmwant_s" "$_acmwant_p" "$_acmwant_b"
+            if [ -n "$_acfix" ]; then
+                _say "rewrote $_acman to match the install (--fix-paths), before zkg ran"
+            else
+                _say "  manifest: pointed at zkg's own defaults with no packages recorded,"
+                _say "            so it was rewritten to match the install before zkg ran"
+            fi
+        fi
+    fi
+
+    # 5. Which zkg. The env's own is preferred: its baked ZEEK_PYTHON_DIR matches
+    #    this build, where a zkg from PATH may belong to another install entirely.
+    _aczkg=
+    if [ -x "$_acp/bin/zkg" ]; then
+        _aczkg=$_acp/bin/zkg
+    else
+        _aczkg=$(command -v zkg 2>/dev/null) || _aczkg=
+    fi
+    if [ -z "$_aczkg" ]; then
+        _die "no zkg found: neither $_acp/bin/zkg nor a zkg on PATH
+      install Zeek's bundled zkg with it, or 'pip install zkg'"
+    fi
+
+    # 6. Run it. A subshell rather than `env -u ...`: same effect, one less
+    #    external command, and the PATH edit is visible in one place.
+    _say "wiring zkg for '$_acn' with $_aczkg"
+    # shellcheck disable=SC2030
+    #   Every assignment in here is *meant* to die with the subshell: that is
+    #   what makes this the equivalent of `env -u ZKG_CONFIG_FILE ...` without
+    #   the external command, and it is why zenv's own PATH is untouched
+    #   afterwards.
+    (
+        unset ZKG_CONFIG_FILE
+        ZEEK_ZKG_CONFIG_DIR=$_acz
+        ZEEK_ZKG_STATE_DIR=$_acz
+        export ZEEK_ZKG_CONFIG_DIR ZEEK_ZKG_STATE_DIR
+        PATH=$_acp/bin:$PATH
+        export PATH
+        "$_aczkg" autoconfig --force
+    ) >&2 || _die "zkg autoconfig failed (exit $?); the config was left as it was"
+
+    _accfg=$_acz/config
+    [ -f "$_accfg" ] || _die "zkg wrote no config at $_accfg
+      it may have fallen back to another state directory; check $_aczkg"
+
+    # 7. state_dir. zkg autoconfig never writes it -- it comes from
+    #    default_state_dir() at config-creation time only -- so on a re-run
+    #    against an existing config whatever was there survives.
+    _acsd=$(_ini_get "$_accfg" state_dir) || _acsd=
+    if [ "$(_resolve_soft "$_acsd")" != "$_acz" ]; then
+        _ini_set "$_accfg" paths state_dir "$_acz"
+        _say "  state_dir: rewritten to $_acz"
+    fi
+
+    # 8. zeek_dist: verified, or empty.
+    _dist_tree "$_acn" "$_acdist"
+    _dist_state "$_DIST_TREE" "$_acver"
+    if [ "$_DIST_STATE" = verified ]; then
+        _ini_set "$_accfg" paths zeek_dist "$_DIST_TREE"
+        _say "  zeek_dist: $_DIST_TREE (verified)"
+        # This is the only moment zenv can honestly record what the install came
+        # from: the tree matches it right now. A shared checkout moves on, and
+        # the recorded commit is what lets activation name the one to come back
+        # to instead of merely reporting that something differs. Recorded with
+        # the version it verified against, and never cleared afterwards -- drift
+        # is exactly when it is needed.
+        _dist_commit "$_DIST_TREE"
+        if [ -n "$_DIST_HEAD" ]; then
+            _kv_set "$(_env_file "$_acn")" src_commit "$_DIST_HEAD"
+            _kv_set "$(_env_file "$_acn")" src_version "$_acver"
+            _say "             at commit $(_short_sha "$_DIST_HEAD")${_DIST_DESC:+ ($_DIST_DESC)} -- recorded, so activating"
+            _say "             '$_acn' says so if that tree is checked out elsewhere"
+        fi
+    else
+        _ini_set "$_accfg" paths zeek_dist ''
+        _say "  zeek_dist: left empty -- $_DIST_STATE: $_DIST_WHY"
+        if [ "$_DIST_STATE" = drifted ]; then
+            _say "             a stale tree would build a plugin against the wrong"
+            _say "             sources, so zenv writes nothing rather than that"
+        fi
+    fi
+
+    # 9. Show the wiring, then re-check the invariant that keeps the *next* zkg
+    #    call safe.
+    _say "zkg config: $_accfg"
+    for _ackey in state_dir script_dir plugin_dir bin_dir zeek_dist; do
+        _acv=$(_ini_get "$_accfg" "$_ackey") || _acv=
+        _say "  $_ackey = $_acv"
+    done
+
+    if [ -f "$_acman" ] && ! _ac_manifest_agrees; then
+        # The first-ever wiring lands here every time: zkg wrote this manifest
+        # from its no-config fallback moments before it wrote the config. Empty
+        # and self-contained means there is nothing to relocate, so correct it
+        # and say so rather than sending the caller back for --fix-paths.
+        if _ac_manifest_is_fresh_scaffold; then
+            _manifest_set "$_acman" "$_acmwant_s" "$_acmwant_p" "$_acmwant_b"
+            _say "  manifest: zkg wrote it from its own defaults before the config"
+            _say "            existed; rewritten to match, no packages were affected"
+        else
+            _die "after wiring, $_acman still disagrees with the config:
+$_AC_MANIFEST_DIFF
+      the next zkg call would move and delete one of those directories
+      run 'zenv autoconfig $_acn --fix-paths'"
+        fi
+    fi
+
+    _AC_CONFIG=$_accfg
+}
+
+# The gate's refusal, shared by the script and plugin checks.
+_ac_gate() {
+    _agn=$1
+    _agp=$2
+    _agwhat=$3
+    _agdir=$4
+    _under "$_agdir" "$_agp" && return 0
+    _agowner=$(_owner_env "$_agdir") || _agowner=
+    _agsuffix=
+    [ -n "$_agowner" ] && _agsuffix="
+      that directory belongs to environment '$_agowner', whose packages a single
+      zkg call would move and delete"
+    _die "refusing to wire zkg for '$_agn': its install reports a $_agwhat
+      directory outside its own prefix
+        $_agwhat dir: $_agdir
+        prefix:       $_agp$_agsuffix
+      that is what a tree configured with another env's --prefix, or installed
+      through a symlink, looks like -- reconfigure and reinstall with
+        ./configure --prefix=\"\$(zenv prefix $_agn)\"
+      no zkg command was run"
+}
+
+# Compare the manifest's three path keys with what the install reports, by
+# resolved path. Sets _AC_MANIFEST_DIFF to the indented report of what differs.
+# Reads _acman and the _acmwant_* set from its caller.
+_ac_manifest_agrees() {
+    _AC_MANIFEST_DIFF=
+    _amok=0
+    for _amk in script_dir plugin_dir bin_dir; do
+        _amgot=$(_manifest_get "$_acman" "$_amk") \
+            || _die "cannot read $_acman; it is not valid JSON"
+        case $_amk in
+            script_dir) _amwant=$_acmwant_s ;;
+            plugin_dir) _amwant=$_acmwant_p ;;
+            *) _amwant=$_acmwant_b ;;
+        esac
+        [ "$(_resolve_soft "$_amgot")" = "$(_resolve_soft "$_amwant")" ] && continue
+        _amok=1
+        _AC_MANIFEST_DIFF="$_AC_MANIFEST_DIFF      $_amk: manifest says $_amgot
+        the install says $_amwant
+"
+    done
+    return $_amok
+}
+
+# A manifest that only zkg's own no-config fallback could have written: no
+# packages recorded, and all three paths inside the env's *state* directory
+# rather than any install prefix.
+#
+# `zkg autoconfig` constructs its Manager before it writes the config, so on a
+# brand-new env there is no config to read at that moment and zkg falls back to
+# state_dir/{script_dir,plugin_dir,bin} (zkg:213-244, row 5) -- then writes the
+# real config naming the install a moment later. The two therefore always
+# disagree after a first-ever wiring, which made every new env end on a refusal
+# and need a second command with --fix-paths.
+#
+# Rewriting *this* shape is safe in a way that rewriting a disagreement in
+# general is not: with no packages recorded there is nothing for finding 6 to
+# relocate, and paths under the state dir cannot be another env's install. Any
+# other disagreement still refuses, because that is the shape that destroyed
+# ja3 and ja4 during exploration.
+#
+# Reads _acman and _acz from its caller.
+_ac_manifest_is_fresh_scaffold() {
+    _manifest_count "$_acman" >/dev/null 2>&1 || return 1
+    [ "$(_manifest_count "$_acman")" = 0 ] || return 1
+    _afsz=$(_resolve_soft "$_acz")
+    for _afsk in script_dir plugin_dir bin_dir; do
+        _afsv=$(_manifest_get "$_acman" "$_afsk" 2>/dev/null) || return 1
+        [ -n "$_afsv" ] || return 1
+        _under "$(_resolve_soft "$_afsv")" "$_afsz" || return 1
+    done
+    return 0
+}
+
+cmd_dist() {
+    _name=
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -*) _die "dist: unknown option '$1'" ;;
+            *)
+                [ -z "$_name" ] || _die "dist: only one name, got '$_name' and '$1'"
+                _name=$1
+                ;;
+        esac
+        shift
+    done
+    _name=$(_target_env "$_name")
+
+    _dp=$(_realpath "$(_env_get "$_name" prefix)") \
+        || _die "cannot resolve the prefix of '$_name'"
+    _dzc=$_dp/bin/zeek-config
+    if [ ! -x "$_dzc" ]; then
+        # Verification is a comparison against the install; with no install there
+        # is nothing to compare against, and a bare source path would be a guess.
+        _warn "nothing installed at $_dp yet, so no tree can be verified"
+        return 1
+    fi
+    _dver=$("$_dzc" --version 2>/dev/null) || _dver=
+    _ddist=$("$_dzc" --zeek_dist 2>/dev/null) || _ddist=
+    _dist_tree "$_name" "$_ddist"
+    _dist_state "$_DIST_TREE" "$_dver"
+
+    # stdout stays empty unless the tree verifies, so --zeek-dist="$(zenv dist)"
+    # is empty rather than wrong when zenv cannot vouch for it.
+    if [ "$_DIST_STATE" = verified ]; then
+        printf '%s\n' "$_DIST_TREE"
+        _say "verified: $_DIST_WHY"
+        return 0
+    fi
+    _warn "no verified source tree for '$_name' ($_DIST_STATE): $_DIST_WHY"
+    # "Unverified" is the diagnosis; the commit it was built from is the fix, so
+    # say it here too rather than making the caller run doctor to find out.
+    _dist_reminder "$_name" "$_dp"
+    case $_REMIND_STATE in
+        checkout | unknown-commit) _warn "$_REMIND" ;;
+    esac
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# The compatibility symlinks
+#
+# Activation is shell-local and the symlinks are not load-bearing, so `zenv
+# link` is optional: it exists for non-activated shells and for anything that
+# hardcodes ~/zeek or ~/.zkg. There is one case where it is *not* optional, and
+# `zenv adopt --move` does it for you -- a moved install's baked prefix is still
+# its old path, so that environment resolves through the symlink.
+#
+# Where the two paths are is recorded in the root's `config` as zeek_link and
+# zkg_link, defaulting to $HOME/zeek and $HOME/.zkg. Those keys are bookkeeping
+# for `zenv uninstall`, which has to know what to remove; whether an
+# environment is linked *now* is always decided by reading the symlink, never by
+# trusting the key.
+# ---------------------------------------------------------------------------
+
+# _link_path zeek|zkg -- where that symlink lives.
+_link_path() {
+    case $1 in
+        zeek)
+            _lpk=zeek_link
+            _lpsfx=/zeek
+            ;;
+        zkg)
+            _lpk=zkg_link
+            _lpsfx=/.zkg
+            ;;
+        *) _die "internal error: _link_path $1" ;;
+    esac
+    _lpv=$(_config_get "$_lpk" 2>/dev/null) || _lpv=
+    if [ -z "$_lpv" ]; then
+        [ -n "${HOME:-}" ] \
+            || _die "HOME is not set, so zenv cannot tell where ~$_lpsfx is
+      set $_lpk in $(_config_file) to say where the symlink should go"
+        _lpv=$HOME$_lpsfx
+    fi
+    printf '%s' "$_lpv"
+}
+
+# Record where a symlink was put, so `zenv uninstall` removes what zenv made
+# rather than what it assumes zenv made.
+_link_record() {
+    _lrf=$(_config_file)
+    if [ ! -f "$_lrf" ]; then
+        _zenv_root
+        mkdir -p "$ZENV_ROOT_RESOLVED" || _die "cannot create $ZENV_ROOT_RESOLVED"
+        printf '# zenv root metadata. Edited by zenv; safe to read.\n' >"$_lrf" \
+            || _die "cannot write $_lrf"
+    fi
+    _kv_set "$_lrf" "$1" "$2"
+}
+
+# _link_state <path>; sets _LINK_STATE to missing|symlink|dir|other and
+# _LINK_TARGET to the symlink's text. -L is tested first, because a symlink to a
+# directory answers yes to -d as well.
+_link_state() {
+    _LINK_TARGET=
+    if [ -L "$1" ]; then
+        _LINK_STATE=symlink
+        _LINK_TARGET=$(readlink "$1" 2>/dev/null) || _LINK_TARGET=
+    elif [ -d "$1" ]; then
+        _LINK_STATE=dir
+    elif [ -e "$1" ]; then
+        _LINK_STATE=other
+    else
+        _LINK_STATE=missing
+    fi
+}
+
+# Where a symlink points, as an absolute path, without resolving it. Read from
+# the link text rather than from _realpath so a *dangling* link still reports
+# its intended destination -- which is what decides whether it is zenv's.
+_link_dest() {
+    case $2 in
+        /*) printf '%s' "$2" ;;
+        *)
+            _ldd=${1%/*}
+            [ -n "$_ldd" ] || _ldd=/
+            printf '%s' "$_ldd/$2"
+            ;;
+    esac
+}
+
+# The target to write into a symlink at <path>: relative when the destination is
+# inside the link's own directory, absolute otherwise. So ~/zeek becomes
+# `zenv/default/zeek`, and moving $HOME does not break it.
+_relative_link() {
+    _rld=${1%/*}
+    [ -n "$_rld" ] || _rld=/
+    _rld=$(_resolve_soft "$_rld")
+    case $2 in
+        "$_rld"/*) printf '%s' "${2#"$_rld"/}" ;;
+        *) printf '%s' "$2" ;;
+    esac
+}
+
+# Refuse a link path zenv did not create and must not destroy. Both paths are
+# checked before either is swapped, so a refusal on the second never leaves the
+# first one changed.
+_link_check() {
+    _link_state "$1"
+    case $_LINK_STATE in
+        dir)
+            _die "$1 is a real directory, not a symlink
+      zenv will not replace it. 'zenv adopt <name>' registers the install that
+      is already there and moves it into the root, or move it aside yourself"
+            ;;
+        other)
+            _die "$1 exists and is neither a directory nor a symlink
+      move it aside yourself; zenv will not replace it"
+            ;;
+    esac
+}
+
+# Put a symlink at <path> pointing at <target>, without the path ever being
+# missing: the link is made under a temporary name in the same directory and
+# rename(2)'d over the old one, which is atomic. A concurrent reader sees either
+# the old target or the new one, never nothing.
+#
+# The flag is the whole difficulty. A plain `mv` onto a symlink that points at a
+# directory *follows* it and drops the new link inside that directory -- so
+# relinking ~/zeek from a to b would leave ~/zenv/a/zeek/zeek.zenv-link.123
+# behind and ~/zeek still pointing at a. Suppressing that is spelled -h on the
+# BSD side and -T on the GNU side, with no portable spelling, so both are tried
+# and each attempt is *verified* rather than trusted: the temporary must be gone
+# and the path must read back the new target. Anything a rejected attempt left
+# inside the destination is removed before the next one.
+_swap_symlink() {
+    _sspath=$1
+    _sstgt=$2
+    if [ -d "$_sspath" ] && [ ! -L "$_sspath" ]; then
+        # Belt and braces; every caller refuses a real directory already.
+        _die "internal error: refusing to swap a symlink onto the directory $_sspath"
+    fi
+    _sstmp=$_sspath.zenv-link.$$
+    _sstmpb=${_sstmp##*/}
+    rm -f "$_sstmp" 2>/dev/null || true
+    ln -s "$_sstgt" "$_sstmp" || _die "cannot create a symlink at $_sstmp"
+
+    for _ssf in -h -T ''; do
+        if [ -z "$_ssf" ]; then
+            # Neither flag understood. Unlink and relink: the path is missing for
+            # an instant, which is the best such an mv allows, and better than
+            # refusing to link at all.
+            rm -f "$_sspath" 2>/dev/null || true
+            mv "$_sstmp" "$_sspath" 2>/dev/null || true
+        else
+            mv "$_ssf" "$_sstmp" "$_sspath" 2>/dev/null || true
+        fi
+        if [ ! -L "$_sstmp" ] && [ "$(readlink "$_sspath" 2>/dev/null)" = "$_sstgt" ]; then
+            return 0
+        fi
+        rm -f "$_sspath/$_sstmpb" 2>/dev/null || true
+    done
+
+    rm -f "$_sstmp" 2>/dev/null || true
+    _die "cannot move the new symlink into place at $_sspath"
+}
+
+cmd_link() {
+    _name=
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -*) _die "link: unknown option '$1'" ;;
+            *)
+                [ -z "$_name" ] || _die "link: only one name, got '$_name' and '$1'"
+                _name=$1
+                ;;
+        esac
+        shift
+    done
+    _name=$(_target_env "$_name") || exit 1
+
+    # The environment's own paths, not their resolved targets: an adopted-by-link
+    # environment has a symlink for a prefix, and pointing ~/zeek at the
+    # environment keeps `zenv unlink` able to tell the link is zenv's.
+    _lnprefix=$(_env_get "$_name" prefix)
+    _lnzkg=$(_env_get "$_name" zkg_dir)
+    _lnzp=$(_link_path zeek)
+    _lnzk=$(_link_path zkg)
+
+    _link_check "$_lnzp"
+    _link_check "$_lnzk"
+
+    _swap_symlink "$_lnzp" "$(_relative_link "$_lnzp" "$_lnprefix")"
+    _swap_symlink "$_lnzk" "$(_relative_link "$_lnzk" "$_lnzkg")"
+    _link_record zeek_link "$_lnzp"
+    _link_record zkg_link "$_lnzk"
+
+    _say "linked '$_name' as the system default:"
+    _say "  $_lnzp -> $(readlink "$_lnzp" 2>/dev/null)"
+    _say "  $_lnzk -> $(readlink "$_lnzk" 2>/dev/null)"
+    if [ ! -x "$_lnprefix/bin/zeek-config" ]; then
+        _warn "'$_name' has nothing installed at $_lnprefix yet, so both symlinks
+      now point at empty directories"
+    fi
+    _say ""
+    _say "this is for shells that never activate anything; 'zenv activate $_name'"
+    _say "is unaffected by it, and 'zenv unlink' removes both symlinks."
+}
+
+cmd_unlink() {
+    [ $# -eq 0 ] || _die "unlink: unexpected argument '$1'"
+    _zenv_root
+
+    _unany=
+    for _uk in zeek zkg; do
+        _up=$(_link_path "$_uk")
+        _link_state "$_up"
+        case $_LINK_STATE in
+            missing) _say "$_up: nothing there" ;;
+            dir)
+                _warn "$_up is a real directory, not one of zenv's symlinks -- left alone"
+                ;;
+            other)
+                _warn "$_up is not a symlink -- left alone"
+                ;;
+            symlink)
+                _ud=$(_resolve_soft "$(_link_dest "$_up" "$_LINK_TARGET")")
+                if _under "$_ud" "$ZENV_ROOT_RESOLVED"; then
+                    rm -f "$_up" || _die "cannot remove $_up"
+                    _say "removed $_up (was -> $_LINK_TARGET)"
+                    _unany=1
+                else
+                    _warn "$_up -> $_LINK_TARGET points outside $ZENV_ROOT_RESOLVED
+      zenv did not create it, so it was left alone"
+                fi
+                ;;
+        esac
+    done
+
+    if [ -n "$_unany" ]; then
+        _say ""
+        _say "the environments themselves are untouched; only the symlinks are gone."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Adopting an install that already exists
+# ---------------------------------------------------------------------------
+
+cmd_adopt() {
+    _name=
+    _from=
+    _fromzkg=
+    _zkgset=
+    _mode=
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --from)
+                [ $# -ge 2 ] || _die "adopt: --from needs a directory"
+                _from=$2
+                shift
+                ;;
+            --from=*) _from=${1#--from=} ;;
+            --zkg)
+                [ $# -ge 2 ] || _die "adopt: --zkg needs a directory"
+                _fromzkg=$2
+                _zkgset=1
+                shift
+                ;;
+            --zkg=*)
+                _fromzkg=${1#--zkg=}
+                _zkgset=1
+                ;;
+            --move)
+                [ "$_mode" != link ] || _die "adopt: --move and --link are opposites"
+                _mode='move'
+                ;;
+            --link)
+                [ "$_mode" != move ] || _die "adopt: --move and --link are opposites"
+                _mode='link'
+                ;;
+            -*) _die "adopt: unknown option '$1'" ;;
+            *)
+                [ -z "$_name" ] || _die "adopt: only one name, got '$_name' and '$1'"
+                _name=$1
+                ;;
+        esac
+        shift
+    done
+
+    _check_name "$_name"
+    _zenv_root
+    if _env_exists "$_name"; then
+        _die "environment '$_name' already exists at $(_env_dir "$_name")
+      'zenv list' shows what exists"
+    fi
+
+    _adzp=$(_link_path zeek)
+    [ -n "$_from" ] || _from=$_adzp
+    if [ -z "$_fromzkg" ]; then
+        _fromzkg=$(_link_path zkg)
+    fi
+    for _adp in "$_from" "$_fromzkg"; do
+        case $_adp in
+            /*) : ;;
+            *) _die "adopt: paths must be absolute, got '$_adp'" ;;
+        esac
+    done
+
+    # Default mode: adopting the system default path in place means moving it,
+    # since leaving it there is what makes two environments share one prefix.
+    # Anything else is somebody's install elsewhere, which is linked, not moved.
+    if [ -z "$_mode" ]; then
+        if [ "$(_resolve_soft "$_from")" = "$(_resolve_soft "$_adzp")" ]; then
+            _mode='move'
+        else
+            _mode='link'
+        fi
+    fi
+
+    [ -d "$_from" ] || _die "adopt: no directory at $_from
+      pass --from DIR to say where the install is"
+    _adreal=$(_realpath "$_from") || _die "adopt: cannot resolve $_from"
+    if _under "$_adreal" "$ZENV_ROOT_RESOLVED"; then
+        _die "adopt: $_from is already inside $ZENV_ROOT_RESOLVED
+      it resolves to $_adreal, so it is already a zenv environment or part of one"
+    fi
+    if [ ! -x "$_from/bin/zeek-config" ]; then
+        _warn "$_from has no bin/zeek-config, so it does not look like a Zeek install
+      adopting it anyway; 'zenv doctor $_name' will say what is missing"
+    fi
+
+    _addir=$ZENV_ROOT_RESOLVED/$_name
+    mkdir -p "$ZENV_ROOT_RESOLVED" || _die "cannot create the root: $ZENV_ROOT_RESOLVED"
+    _resolve_root_after_mkdir
+    _addir=$ZENV_ROOT_RESOLVED/$_name
+    if ! mkdir "$_addir" 2>/dev/null; then
+        if [ -e "$_addir" ] || [ -L "$_addir" ]; then
+            _die "$_addir already exists but is not a zenv environment
+      remove it by hand, or pick another name"
+        fi
+        _die "cannot create $_addir"
+    fi
+
+    if [ "$_mode" = move ]; then
+        _adopt_move "$_name" "$_addir" "$_from" "$_fromzkg" "$_zkgset"
+    else
+        _adopt_link "$_name" "$_addir" "$_adreal" "$_fromzkg" "$_zkgset"
+    fi
+}
+
+# Move the tree into the root and leave a symlink where it was, so every path
+# baked into the install -- its own prefix, and the script and plugin dirs its
+# zkg config already names -- still resolves. Finding 6 is not triggered by
+# that, because the relocation test is on realpath and both sides now resolve to
+# the same place.
+_adopt_move() {
+    _amname=$1
+    _amdir=$2
+    _amfrom=$3
+    _amzkg=$4
+    _amzkgset=$5
+
+    if [ -L "$_amfrom" ]; then
+        rmdir "$_amdir" 2>/dev/null || true
+        _die "adopt: $_amfrom is a symlink, so there is nothing to move
+      it points at $(readlink "$_amfrom" 2>/dev/null); adopt that path with
+      --from, or use --link to register it where it is"
+    fi
+
+    mv "$_amfrom" "$_amdir/zeek" || {
+        rmdir "$_amdir" 2>/dev/null || true
+        _die "cannot move $_amfrom to $_amdir/zeek"
+    }
+    _swap_symlink "$_amfrom" "$(_relative_link "$_amfrom" "$_amdir/zeek")"
+    _link_record zeek_link "$_amfrom"
+
+    # The zkg state dir is optional: an install with no zkg state gets an empty
+    # one, which is the same state `zenv new` leaves behind.
+    _amzkgmoved=
+    if [ -L "$_amzkg" ]; then
+        _warn "$_amzkg is a symlink, so it was left alone
+      '$_amname' gets an empty zkg state dir instead"
+        mkdir -p "$_amdir/zkg" || _die "cannot create $_amdir/zkg"
+    elif [ -d "$_amzkg" ]; then
+        mv "$_amzkg" "$_amdir/zkg" || _die "cannot move $_amzkg to $_amdir/zkg"
+        _swap_symlink "$_amzkg" "$(_relative_link "$_amzkg" "$_amdir/zkg")"
+        _link_record zkg_link "$_amzkg"
+        _amzkgmoved=1
+    else
+        if [ -n "$_amzkgset" ]; then
+            _warn "no directory at $_amzkg, so '$_amname' gets an empty zkg state dir"
+        fi
+        mkdir -p "$_amdir/zkg" || _die "cannot create $_amdir/zkg"
+    fi
+
+    # The one key that has to change. script_dir, plugin_dir and bin_dir still
+    # name the old path and must stay that way: they resolve through the symlink
+    # to the same directories the manifest names, which is exactly what keeps the
+    # next zkg invocation from relocating anything.
+    if [ -f "$_amdir/zkg/config" ]; then
+        _ini_set "$_amdir/zkg/config" paths state_dir "$_amdir/zkg"
+    fi
+
+    _write_env_meta "$_amname" "$_amdir/env" "$_amdir/zeek" "$_amdir/zkg" "" moved
+    _write_activate_stub "$_amname" "$_amdir/activate"
+
+    printf '%s\n' "$_amdir/zeek"
+    _say "adopted $_amfrom as '$_amname':"
+    _say "  moved   $_amfrom -> $_amdir/zeek"
+    if [ -n "$_amzkgmoved" ]; then
+        _say "  moved   $_amzkg -> $_amdir/zkg"
+        _say "  rewrote state_dir in $_amdir/zkg/config"
+    fi
+    _say "  symlink $_amfrom -> $(readlink "$_amfrom" 2>/dev/null)"
+    if [ -n "$_amzkgmoved" ]; then
+        _say "  symlink $_amzkg -> $(readlink "$_amzkg" 2>/dev/null)"
+    fi
+    _say ""
+    _say "Keep those symlinks. This install's prefix was baked in at configure"
+    _say "time and is still $_amfrom, so '$_amname' resolves *through* the symlink."
+    _say "'zenv unlink' would leave it unable to find its own scripts and plugins,"
+    _say "until you reinstall Zeek with --prefix=\"\$(zenv prefix $_amname)\"."
+    _say ""
+    _say "next: zenv doctor $_amname"
+}
+
+# Register an install where it is. The environment's prefix becomes a symlink to
+# it, so `zenv prefix` still names one path per environment and activation needs
+# no special case.
+_adopt_link() {
+    _alname=$1
+    _aldir=$2
+    _alfrom=$3
+    _alzkg=$4
+    _alzkgset=$5
+
+    ln -s "$_alfrom" "$_aldir/zeek" || {
+        rmdir "$_aldir" 2>/dev/null || true
+        _die "cannot create the symlink $_aldir/zeek -> $_alfrom"
+    }
+
+    # An explicit --zkg is adopted the same way; without it the environment gets
+    # its own empty state dir rather than silently sharing ~/.zkg, which is the
+    # sharing this whole design exists to end.
+    _alzkgshared=
+    if [ -n "$_alzkgset" ]; then
+        [ -d "$_alzkg" ] || _die "adopt: no directory at $_alzkg"
+        _alzkgreal=$(_realpath "$_alzkg") || _die "adopt: cannot resolve $_alzkg"
+        ln -s "$_alzkgreal" "$_aldir/zkg" \
+            || _die "cannot create the symlink $_aldir/zkg -> $_alzkgreal"
+        _alzkgshared=$_alzkgreal
+    else
+        mkdir -p "$_aldir/zkg" || _die "cannot create $_aldir/zkg"
+    fi
+
+    _write_env_meta "$_alname" "$_aldir/env" "$_aldir/zeek" "$_aldir/zkg" "" linked
+    _write_activate_stub "$_alname" "$_aldir/activate"
+
+    printf '%s\n' "$_aldir/zeek"
+    _say "adopted $_alfrom as '$_alname':"
+    _say "  symlink $_aldir/zeek -> $_alfrom"
+    if [ -n "$_alzkgshared" ]; then
+        _say "  symlink $_aldir/zkg -> $_alzkgshared"
+        _say ""
+        _say "That zkg state dir is shared with whatever else points at it. Two"
+        _say "environments sharing one state dir is the situation 'zenv autoconfig'"
+        _say "refuses to make worse; 'zenv doctor' reports it."
+    else
+        _say "  created $_aldir/zkg   (empty -- 'zenv autoconfig $_alname' fills it)"
+        _say ""
+        _say "next: zenv autoconfig $_alname"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Removing an environment
+# ---------------------------------------------------------------------------
+
+# The environment's directory, proved to be a real directory that is a direct
+# child of the root, and printed physically resolved. Removal is an `rm -rf`, so
+# the target is proved before anything is deleted: a symlink there is refused
+# rather than followed, since following it would delete a tree outside the root
+# that zenv never created.
+#
+# Runs in a subshell at every call site (it prints), so `|| exit 1` is how a
+# refusal reaches the caller -- _die can only exit the subshell.
+_env_real_dir() {
+    _erdn=$1
+    _zenv_root
+    _erd=$ZENV_ROOT_RESOLVED/$_erdn
+    if [ -L "$_erd" ]; then
+        _die "$_erd is a symlink, not an environment directory
+      it points at $(readlink "$_erd" 2>/dev/null), which zenv will not
+      delete. Remove the symlink yourself if that is what you meant"
+    fi
+    [ -d "$_erd" ] || _die "$_erd is not a directory"
+    _erdr=$(_realpath "$_erd") || _die "cannot resolve $_erd"
+    _erdp=${_erdr%/*}
+    [ -n "$_erdp" ] || _erdp=/
+    if [ "$_erdp" != "$ZENV_ROOT_RESOLVED" ] || [ "${_erdr##*/}" != "$_erdn" ]; then
+        _die "$_erd resolves to $_erdr, which is not a direct child of
+      $ZENV_ROOT_RESOLVED -- refusing to delete it"
+    fi
+    printf '%s' "$_erdr"
+}
+
+cmd_remove() {
+    _name=
+    _keepzkg=
+    _yes=
+    _force=
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --keep-zkg) _keepzkg=1 ;;
+            --yes | -y) _yes=1 ;;
+            --force) _force=1 ;;
+            -*) _die "remove: unknown option '$1'" ;;
+            *)
+                [ -z "$_name" ] || _die "remove: only one name, got '$_name' and '$1'"
+                _name=$1
+                ;;
+        esac
+        shift
+    done
+    _require_env "$_name"
+    _zenv_root
+    _rmdir=$ZENV_ROOT_RESOLVED/$_name
+    _rmreal=$(_env_real_dir "$_name") || exit 1
+
+    if [ "${ZENV:-}" = "$_name" ] && [ -z "$_force" ]; then
+        _die "'$_name' is active in this shell
+      run 'zenv deactivate' first, or pass --force"
+    fi
+
+    _rmlinked=
+    for _rk in zeek zkg; do
+        _rp=$(_link_path "$_rk")
+        _link_state "$_rp"
+        [ "$_LINK_STATE" = symlink ] || continue
+        _rd=$(_resolve_soft "$(_link_dest "$_rp" "$_LINK_TARGET")")
+        if [ "$_rd" = "$_rmreal" ] || _under "$_rd" "$_rmreal"; then
+            _rmlinked="$_rmlinked$_rp "
+        fi
+    done
+    _rmlinked=${_rmlinked% }
+    if [ -n "$_rmlinked" ] && [ -z "$_force" ]; then
+        _die "'$_name' is the system default: $_rmlinked
+      run 'zenv unlink' first, or pass --force to remove it and leave those
+      symlinks dangling"
+    fi
+
+    # The recorded prefix can point outside the environment -- that is what
+    # `adopt --link` makes -- and `rm -rf` on the directory removes the symlink,
+    # never the install. Say so, because "removed" should not be ambiguous.
+    _rmpfx=$(_resolve_soft "$(_env_get "$_name" prefix)")
+    _rmoutside=
+    if ! _under "$_rmpfx" "$_rmreal"; then
+        _rmoutside=$_rmpfx
+    fi
+
+    if [ -z "$_yes" ]; then
+        if [ ! -t 0 ]; then
+            _die "remove: stdin is not a terminal, so nothing was removed
+      pass --yes to confirm removing $_rmdir"
+        fi
+        if [ -n "$_keepzkg" ]; then
+            printf 'zenv: remove %s, keeping its zkg state? [y/N] ' "$_rmdir" >&2
+        else
+            printf 'zenv: remove %s and everything in it? [y/N] ' "$_rmdir" >&2
+        fi
+        IFS= read -r _rmans || _rmans=
+        case $_rmans in
+            y | Y | yes | YES) : ;;
+            *)
+                _say "not removed"
+                return 1
+                ;;
+        esac
+    fi
+
+    if [ -n "$_keepzkg" ]; then
+        # Everything but the state dir, so the packages an environment installed
+        # survive a rebuild-from-scratch. What is left is no longer an
+        # environment: it has no `env` file, so `zenv list` skips it.
+        rm -rf "$_rmdir/zeek" "$_rmdir/env" "$_rmdir/activate" \
+            || _die "cannot remove parts of $_rmdir"
+        _say "removed '$_name', kept $_rmdir/zkg"
+        _say "  that directory is no longer an environment; 'rm -rf $_rmdir'"
+        _say "  finishes the job, and 'zenv new $_name' would refuse until it is gone"
+    else
+        rm -rf "$_rmdir" || _die "cannot remove $_rmdir"
+        _say "removed '$_name' ($_rmdir)"
+    fi
+
+    if [ -n "$_rmoutside" ]; then
+        _say "  the install at $_rmoutside was not touched -- '$_name' only pointed at it"
+    fi
+    if [ -n "$_rmlinked" ]; then
+        _warn "these symlinks now dangle: $_rmlinked
+      'zenv unlink' removes them, 'zenv link <name>' repoints them"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# restore -- the exact inverse of `zenv adopt --move`
+#
+# Moving the tree back is *more* correct than leaving it, not merely tidier.
+# A moved install's baked prefix is still its old path (finding 1), which is why
+# `adopt --move` left a symlink behind in the first place; putting the tree back
+# where that baked prefix names makes the symlink unnecessary rather than merely
+# absent.
+#
+# Only `adopted=moved` environments qualify. An install you built yourself has
+# its own prefix baked in and has nowhere to go back to, so restoring one would
+# break it -- which is the whole reason the metadata records how an environment
+# came to be instead of guessing from the symlinks.
+# ---------------------------------------------------------------------------
+
+# _restore_plan <name>: work out both halves before either is touched, so a
+# refusal on the second can never leave the first half-done. Sets
+# _RS_ZEEK_TO/_RS_ZEEK_TGT/_RS_ZEEK_TREE and the _RS_ZKG_* trio, each empty when
+# that half was not moved. Returns 1 when there is nothing to restore.
+_restore_plan() {
+    _rsn=$1
+    _zenv_root
+    _RS_ZEEK_TO=; _RS_ZEEK_TGT=; _RS_ZEEK_TREE=
+    _RS_ZKG_TO=; _RS_ZKG_TGT=; _RS_ZKG_TREE=
+
+    for _rsk in zeek zkg; do
+        _rsp=$(_link_path "$_rsk")
+        if [ "$_rsk" = zeek ]; then
+            _rstree=$(_env_get "$_rsn" prefix)
+        else
+            _rstree=$(_env_get "$_rsn" zkg_dir)
+        fi
+        _link_state "$_rsp"
+        [ "$_LINK_STATE" = symlink ] || continue
+        # The link text, not the resolved target: a dangling link still names
+        # where it meant to point, which is what decides whether it is zenv's.
+        _rsd=$(_resolve_soft "$(_link_dest "$_rsp" "$_LINK_TARGET")")
+        [ "$_rsd" = "$(_resolve_soft "$_rstree")" ] || continue
+        if [ -L "$_rstree" ]; then
+            _die "cannot restore '$_rsn': $_rstree is itself a symlink, to
+      $(readlink "$_rstree" 2>/dev/null), so nothing was ever moved
+      'zenv unlink' removes $_rsp"
+        fi
+        [ -d "$_rstree" ] \
+            || _die "cannot restore '$_rsn': $_rstree is not a directory"
+        if [ "$_rsk" = zeek ]; then
+            _RS_ZEEK_TO=$_rsp
+            _RS_ZEEK_TGT=$_LINK_TARGET
+            _RS_ZEEK_TREE=$_rstree
+        else
+            _RS_ZKG_TO=$_rsp
+            _RS_ZKG_TGT=$_LINK_TARGET
+            _RS_ZKG_TREE=$_rstree
+        fi
+    done
+
+    [ -n "$_RS_ZEEK_TO" ] || [ -n "$_RS_ZKG_TO" ]
+}
+
+# True when restoring will leave the environment's own directory with nothing in
+# it, so a dry run can promise its removal as truthfully as the real run does it.
+_rs_will_empty() {
+    _rswe=1
+    _rswl=$(find "$1" -mindepth 1 -maxdepth 1 2>/dev/null)
+    while IFS= read -r _rsc; do
+        [ -n "$_rsc" ] || continue
+        case ${_rsc##*/} in
+            env | activate) continue ;;
+            zeek) [ -n "$_RS_ZEEK_TO" ] && continue ;;
+            zkg) [ -n "$_RS_ZKG_TO" ] && continue ;;
+        esac
+        _rswe=
+        break
+    done <<EOF
+$_rswl
+EOF
+    [ -n "$_rswe" ]
+}
+
+# _restore_one <tree> <destination> <old link text> <dry>
+_restore_one() {
+    if [ -n "$4" ]; then
+        _say "  would move $1 back to $2, removing the symlink"
+        return 0
+    fi
+    rm -f "$2" || _die "cannot remove the symlink $2"
+    if ! mv "$1" "$2"; then
+        # Put the symlink back: a failed restore must leave the state it found,
+        # or the install becomes unreachable at the prefix baked into it.
+        ln -s "$3" "$2" 2>/dev/null || true
+        _die "cannot move $1 back to $2"
+    fi
+    _say "  moved   $1 -> $2   (symlink removed)"
+}
+
+# _restore_apply <name> <dry>. Call _restore_plan first.
+_restore_apply() {
+    _rsan=$1
+    _rsdry=$2
+    _zenv_root
+    _rsadir=$ZENV_ROOT_RESOLVED/$_rsan
+
+    if [ -n "$_RS_ZEEK_TO" ]; then
+        _restore_one "$_RS_ZEEK_TREE" "$_RS_ZEEK_TO" "$_RS_ZEEK_TGT" "$_rsdry"
+    fi
+    if [ -n "$_RS_ZKG_TO" ]; then
+        _restore_one "$_RS_ZKG_TREE" "$_RS_ZKG_TO" "$_RS_ZKG_TGT" "$_rsdry"
+        # state_dir is the one key `adopt --move` rewrote, so it is the only one
+        # reverted. script_dir, plugin_dir and bin_dir in that config -- and every
+        # path in manifest.json -- still name this destination and are left
+        # untouched, which is exactly why finding 6's relocation is never
+        # triggered by either direction of the move.
+        if [ -n "$_rsdry" ]; then
+            if [ -f "$_RS_ZKG_TREE/config" ]; then
+                _say "  would revert state_dir in $_RS_ZKG_TO/config to $_RS_ZKG_TO"
+            fi
+        elif [ -f "$_RS_ZKG_TO/config" ]; then
+            _ini_set "$_RS_ZKG_TO/config" paths state_dir "$_RS_ZKG_TO"
+            _say "  reverted state_dir in $_RS_ZKG_TO/config to $_RS_ZKG_TO"
+        fi
+    fi
+
+    if [ -n "$_rsdry" ]; then
+        _say "  would remove $_rsadir/env and $_rsadir/activate"
+        if _rs_will_empty "$_rsadir"; then
+            _say "  would remove $_rsadir (nothing would be left in it)"
+            _RS_EMPTIED=1
+        fi
+        return 0
+    fi
+
+    rm -f "$_rsadir/env" "$_rsadir/activate" \
+        || _die "cannot remove the metadata in $_rsadir"
+    _say "  removed $_rsadir/env and $_rsadir/activate"
+    _RS_EMPTIED=
+    if rmdir "$_rsadir" 2>/dev/null; then
+        _say "  removed $_rsadir (nothing left in it)"
+        _RS_EMPTIED=1
+    fi
+    return 0
+}
+
+cmd_restore() {
+    _name=
+    _yes=
+    _dry=
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --yes | -y) _yes=1 ;;
+            --dry-run) _dry=1 ;;
+            -*) _die "restore: unknown option '$1'" ;;
+            *)
+                [ -z "$_name" ] || _die "restore: only one name, got '$_name' and '$1'"
+                _name=$1
+                ;;
+        esac
+        shift
+    done
+    _name=$(_target_env "$_name") || exit 1
+    _zenv_root
+
+    _rsadopted=$(_env_get "$_name" adopted)
+    case $_rsadopted in
+        moved) : ;;
+        linked)
+            _die "'$_name' was adopted with --link, so nothing was moved and there is
+      nothing to move back. 'zenv unlink' removes the symlinks; 'zenv remove
+      $_name' deletes the environment without touching the install"
+            ;;
+        *)
+            _die "'$_name' was created by 'zenv new', not adopted, so it has nowhere to
+      go back to: the prefix baked into that install is $(_env_get "$_name" prefix)
+      'zenv remove $_name' deletes it; 'zenv unlink' removes any symlinks"
+            ;;
+    esac
+
+    if ! _restore_plan "$_name"; then
+        _die "nothing to restore for '$_name': neither $(_link_path zeek) nor
+      $(_link_path zkg) is a symlink into $ZENV_ROOT_RESOLVED/$_name
+      it may have been restored already; 'zenv doctor $_name' shows the state"
+    fi
+
+    if [ -z "$_dry" ] && [ -z "$_yes" ]; then
+        if [ ! -t 0 ]; then
+            _die "restore: stdin is not a terminal, so nothing was moved
+      pass --yes to confirm, or --dry-run to see what would happen"
+        fi
+        [ -n "$_RS_ZEEK_TO" ] && _say "would move $_RS_ZEEK_TREE -> $_RS_ZEEK_TO"
+        [ -n "$_RS_ZKG_TO" ] && _say "would move $_RS_ZKG_TREE -> $_RS_ZKG_TO"
+        printf 'zenv: restore %s, undoing its adoption? [y/N] ' "$_name" >&2
+        IFS= read -r _rsans || _rsans=
+        case $_rsans in
+            y | Y | yes | YES) : ;;
+            *)
+                _say "not restored"
+                return 1
+                ;;
+        esac
+    fi
+
+    if [ -n "$_dry" ]; then
+        _say "restore '$_name' would:"
+    else
+        _say "restored '$_name':"
+    fi
+    _restore_apply "$_name" "$_dry"
+
+    if [ -z "$_dry" ]; then
+        _say ""
+        _say "that install's baked prefix is $_RS_ZEEK_TO again, so it needs no symlink."
+        _say "'zenv adopt $_name' brings it back under $ZENV_ROOT_RESOLVED."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# uninstall -- removing zenv itself
+#
+# The whole logic lives here rather than in uninstall.sh, and the reason is not
+# tidiness: after `make install` the repo checkout may be deleted, moved or on
+# another branch, so the installed script is the only thing guaranteed to still
+# exist -- and it is the one that knows the layout *it* created. Everything this
+# needs (_realpath, the config/env parser, the symlink swap, the INI rewrite,
+# restore) is already here; a second implementation is how the two drift apart.
+#
+# `make uninstall`, `./uninstall.sh` and `zenv uninstall` are therefore the same
+# code path with the same flags, and tests/test_uninstall.sh runs the
+# leaves-no-trace assertion through all three.
+#
+# What it must never do is remove something it did not create: a real ~/zeek or
+# ~/.zkg, an install you built yourself, a build tree, a ~/.zkg/clones cache.
+# Those are reported, not deleted.
+# ---------------------------------------------------------------------------
+
+# Where install.sh put things. Derived, not baked, so an uninstall run from the
+# repo copy resolves the same paths the installed copy would.
+_un_paths() {
+    [ -n "${HOME:-}" ] \
+        || _die "HOME is not set, so zenv cannot tell where install.sh put things"
+    UN_BASE=$HOME/$ZENV_INSTALL_SUBDIR
+    UN_BIN=$UN_BASE/bin/zenv
+    UN_BASH=$UN_BASE/share/bash-completion/completions/zenv
+    UN_ZSH=$UN_BASE/share/zsh/site-functions/_zenv
+}
+
+# Every file install.sh might have written its block into. Searched rather than
+# assumed, so a block moved to another rc file is still found and every file
+# holding one is cleaned.
+_rc_candidates() {
+    [ -n "${HOME:-}" ] || return 0
+    printf '%s\n' "$HOME/.zprofile" "$HOME/.zshrc" "$HOME/.bash_profile" \
+        "$HOME/.bashrc" "$HOME/.profile" "$HOME/.config/fish/config.fish"
+}
+
+# The lines install.sh writes between the markers, and only those. Anything else
+# in there means the block was hand-edited; a block that no longer brackets only
+# zenv's lines is left alone rather than guessed at.
+_rc_body_line() {
+    _rcb=$(_trim "$1")
+    case $_rcb in
+        '' | '#'*) return 0 ;;
+        'case ":$PATH:"'*) return 0 ;;
+        'eval "$(zenv init'*) return 0 ;;
+        'zenv activate '*) return 0 ;;
+    esac
+    return 1
+}
+
+# _rc_scan <file>; sets _RC_STATE to none|clean|mangled and _RC_WHY.
+_rc_scan() {
+    _RC_STATE=none
+    _RC_WHY=
+    [ -f "$1" ] || return 0
+    _rcnb=0
+    _rcne=0
+    _rcin=
+    _rcbad=
+    while IFS= read -r _line || [ -n "$_line" ]; do
+        if [ "$_line" = "$ZENV_RC_BEGIN" ]; then
+            _rcnb=$((_rcnb + 1))
+            _rcin=1
+            continue
+        fi
+        if [ "$_line" = "$ZENV_RC_END" ]; then
+            _rcne=$((_rcne + 1))
+            [ -n "$_rcin" ] || _rcbad='an end marker comes before the start marker'
+            _rcin=
+            continue
+        fi
+        [ -n "$_rcin" ] || continue
+        _rc_body_line "$_line" || _rcbad="it contains a line zenv did not write: $_line"
+    done <"$1"
+
+    if [ "$_rcnb" = 0 ] && [ "$_rcne" = 0 ]; then
+        return 0
+    fi
+    if [ "$_rcnb" != 1 ] || [ "$_rcne" != 1 ]; then
+        _RC_STATE=mangled
+        _RC_WHY="there are $_rcnb start markers and $_rcne end markers"
+        return 0
+    fi
+    if [ -n "$_rcin" ]; then
+        _RC_STATE=mangled
+        _RC_WHY='the block is never closed'
+        return 0
+    fi
+    if [ -n "$_rcbad" ]; then
+        _RC_STATE=mangled
+        _RC_WHY=$_rcbad
+        return 0
+    fi
+    _RC_STATE=clean
+}
+
+# The file with the block taken out, on stdout. A no-op on a file that has none,
+# which is what lets the backup comparison use one code path for both modes.
+_rc_stripped() {
+    _rcin=
+    while IFS= read -r _line || [ -n "$_line" ]; do
+        if [ -z "$_rcin" ] && [ "$_line" = "$ZENV_RC_BEGIN" ]; then
+            _rcin=1
+            continue
+        fi
+        if [ -n "$_rcin" ]; then
+            if [ "$_line" = "$ZENV_RC_END" ]; then
+                _rcin=
+            fi
+            continue
+        fi
+        printf '%s\n' "$_line"
+    done <"$1"
+}
+
+_rc_strip_file() {
+    _rct=$1.zenv.$$
+    _rc_stripped "$1" >"$_rct" || return 1
+    mv -f "$_rct" "$1"
+}
+
+# True when any of zenv's own state is still on the machine: the script, either
+# completion file, a block in any rc file, the root, or a ~/zeek or ~/.zkg
+# symlink pointing into the root. Every one of those is something a step below
+# would remove or report, so "none of them" is the one case where there is
+# nothing to undo -- and that case must not prompt and must not fail. It is
+# asked as a separate question rather than inferred from the steps' output
+# because the confirmation prompt comes before they run.
+#
+# Deliberately broader than "is the script there": a script removed by hand
+# leaves the rc block and the environments, and those are the parts that still
+# need undoing.
+_un_present() {
+    for _unpp in "$UN_BIN" "$UN_BASH" "$UN_ZSH"; do
+        if [ -e "$_unpp" ] || [ -L "$_unpp" ]; then
+            return 0
+        fi
+    done
+
+    _unprcs=$(_rc_candidates)
+    while IFS= read -r _unpf; do
+        [ -n "$_unpf" ] || continue
+        _rc_scan "$_unpf"
+        [ "$_RC_STATE" = none ] || return 0
+    done <<EOF
+$_unprcs
+EOF
+
+    # Even an empty root is state: step 5 removes it, and its config file says
+    # where two symlinks belong.
+    [ -d "$ZENV_ROOT_RESOLVED" ] && return 0
+
+    # A link into a root that no longer exists is dangling, and still zenv's --
+    # read from the link text, so the missing root does not hide it.
+    for _unpk in zeek zkg; do
+        _unpp=$(_link_path "$_unpk")
+        _link_state "$_unpp"
+        [ "$_LINK_STATE" = symlink ] || continue
+        _unpd=$(_resolve_soft "$(_link_dest "$_unpp" "$_LINK_TARGET")")
+        _under "$_unpd" "$ZENV_ROOT_RESOLVED" && return 0
+    done
+
+    return 1
+}
+
+# _un_act <would phrasing> <did phrasing> <command...>
+_un_act() {
+    _unw=$1
+    _undid=$2
+    shift 2
+    if [ -n "$_UN_DRY" ]; then
+        _say "  would $_unw"
+        return 0
+    fi
+    "$@" || _die "cannot $_unw"
+    _say "  $_undid"
+}
+
+# Something zenv is leaving behind, printed now and listed again at the end.
+_un_keep() {
+    _UN_LEFT=$_UN_LEFT"  $1$NL"
+    _say "  kept    $1"
+}
+
+# Paths this run has removed (or, in a dry run, would remove), so the root check
+# below is not fooled by state the earlier steps have already accounted for.
+_un_gone_add() { _UN_GONE=$_UN_GONE$1$NL; }
+_un_is_gone() {
+    case "$NL$_UN_GONE" in
+        *"$NL$1$NL"*) return 0 ;;
+    esac
+    return 1
+}
+
+# The environments step 2 restored, and the paths it moved their installs back
+# to. Both lists exist so the later steps do not describe state this run has just
+# produced: a restored ~/zeek is a real directory again, and saying "zenv never
+# adopted it" of the one it just put back would be exactly backwards.
+_un_back_add() { _UN_BACK=$_UN_BACK$1$NL; }
+_un_is_back() {
+    case "$NL$_UN_BACK" in
+        *"$NL$1$NL"*) return 0 ;;
+    esac
+    return 1
+}
+
+# Step 2: put an adopted install back, then take away the symlinks zenv made.
+_un_links() {
+    for _unn in $(_each_env); do
+        [ "$(_env_get "$_unn" adopted)" = moved ] || continue
+        _restore_plan "$_unn" || continue
+        _say "'$_unn' was adopted by moving an install into the root:"
+        _RS_EMPTIED=
+        _restore_apply "$_unn" "$_UN_DRY"
+        [ -n "$_RS_EMPTIED" ] && _un_gone_add "$ZENV_ROOT_RESOLVED/$_unn"
+        _un_back_add "$_unn"
+        [ -n "$_RS_ZEEK_TO" ] && _un_back_add "$_RS_ZEEK_TO"
+        [ -n "$_RS_ZKG_TO" ] && _un_back_add "$_RS_ZKG_TO"
+    done
+
+    for _unk in zeek zkg; do
+        _unp=$(_link_path "$_unk")
+        # Already dealt with above: the symlink went when the tree moved back.
+        _un_is_back "$_unp" && continue
+        _link_state "$_unp"
+        case $_LINK_STATE in
+            missing) continue ;;
+            symlink)
+                _und=$(_resolve_soft "$(_link_dest "$_unp" "$_LINK_TARGET")")
+                if _under "$_und" "$ZENV_ROOT_RESOLVED"; then
+                    _un_act "remove the symlink $_unp -> $_LINK_TARGET" \
+                        "removed the symlink $_unp -> $_LINK_TARGET" \
+                        rm -f "$_unp"
+                else
+                    _un_keep "$_unp -> $_LINK_TARGET (it points outside the root, so zenv did not create it)"
+                fi
+                ;;
+            *)
+                _un_keep "$_unp (a real directory zenv never adopted)"
+                ;;
+        esac
+    done
+}
+
+# True when a directory tree holds nothing this run has not already removed --
+# or, in a dry run, would not have removed. `find ! -type d` is the test, because
+# a symlink to a directory is not -type d and must count as content. Empty
+# directories do not count: that is what an environment whose install was
+# restored, or one that was never built, leaves behind.
+_un_tree_spent() {
+    [ -d "$1" ] || return 1
+    [ ! -L "$1" ] || return 1
+    _untl=$(find "$1" ! -type d 2>/dev/null)
+    _untok=1
+    while IFS= read -r _unte; do
+        [ -n "$_unte" ] || continue
+        _un_is_gone "$_unte" && continue
+        _untok=
+        break
+    done <<EOF
+$_untl
+EOF
+    [ -n "$_untok" ]
+}
+
+_un_size() {
+    _unsz=$(du -sh "$1" 2>/dev/null | cut -f1 | tr -d ' ') || _unsz=
+    [ -n "$_unsz" ] || _unsz='?'
+    printf '%s' "$_unsz"
+}
+
+# Step 3: report, don't delete, the installs you made yourself. Their prefix is
+# baked into their own binaries, so there is nowhere to move them; only you can
+# decide they are finished with. zenv's own metadata beside them goes either way.
+_un_envs() {
+    for _unn in $(_each_env); do
+        # A restored environment is not one of these: in a real run its metadata
+        # is already gone so it is not listed here at all, and a dry run has to
+        # agree with that rather than promise to keep it.
+        _un_is_back "$_unn" && continue
+        _unreal=$(_env_real_dir "$_unn") || exit 1
+
+        if [ -n "$_UN_PURGE" ]; then
+            _unsz=$(_un_size "$_unreal")
+            _un_act "delete '$_unn' and everything in it ($_unreal, $_unsz)" \
+                "deleted '$_unn' ($_unreal, $_unsz)" \
+                rm -rf "$_unreal"
+            _un_gone_add "$_unreal"
+            continue
+        fi
+
+        # A --link adoption's prefix -- and its zkg dir, when --zkg was given --
+        # is a symlink zenv made to something that already existed elsewhere. The
+        # symlink is zenv's, so it goes; what it names is not, so that is neither
+        # moved nor touched.
+        _unwaslink=
+        if [ "$(_env_get "$_unn" adopted)" = linked ]; then
+            for _unlnk in "$(_env_get "$_unn" prefix)" "$(_env_get "$_unn" zkg_dir)"; do
+                [ -n "$_unlnk" ] || continue
+                [ -L "$_unlnk" ] || continue
+                _un_act "remove the symlink $_unlnk -> $(readlink "$_unlnk" 2>/dev/null)" \
+                    "removed the symlink $_unlnk (what it named is untouched)" \
+                    rm -f "$_unlnk"
+                _un_gone_add "$_unlnk"
+                _unwaslink=1
+            done
+        fi
+
+        # An `env` file describing an environment whose zenv is no longer
+        # installed is exactly the stray artifact this command exists to leave
+        # none of, so the metadata goes even when the install stays.
+        for _unm in "$_unreal/env" "$_unreal/activate"; do
+            [ -e "$_unm" ] || continue
+            _un_act "remove $_unm" "removed $_unm" rm -f "$_unm"
+            _un_gone_add "$_unm"
+        done
+
+        if _un_tree_spent "$_unreal"; then
+            # Nothing left in it but the empty directories zenv created, so the
+            # environment goes with its metadata. Leaving it would leave a husk
+            # of two empty directories nothing will ever look in again -- and
+            # `rm -rf` is safe on a tree just proved to hold no files.
+            if [ -n "$_unwaslink" ]; then
+                _unwhy="it only pointed at an install elsewhere, which is left as it is"
+            else
+                _unwhy="nothing was ever installed in it"
+            fi
+            _un_act "remove $_unreal ($_unwhy)" \
+                "removed $_unreal ($_unwhy)" \
+                rm -rf "$_unreal"
+            _un_gone_add "$_unreal"
+        else
+            _unsz=$(_un_size "$_unreal")
+            _un_keep "'$_unn' at $_unreal ($_unsz) -- you installed this; 'rm -rf $_unreal' removes it"
+        fi
+    done
+}
+
+# Step 4: the rc block, the completions and the script itself.
+_un_files() {
+    _unrcs=$(_rc_candidates)
+    while IFS= read -r _unf; do
+        [ -n "$_unf" ] || continue
+        _rc_scan "$_unf"
+        case $_RC_STATE in
+            none) continue ;;
+            mangled)
+                _un_keep "the zenv block in $_unf -- $_RC_WHY, so it was left for you to remove"
+                continue
+                ;;
+        esac
+        _un_act "remove the zenv block from $_unf" \
+            "removed the zenv block from $_unf" \
+            _rc_strip_file "$_unf"
+        _un_backup "$_unf"
+        # install.sh creates the rc file when there is none, so a file holding
+        # nothing once the block is gone is one zenv brought into existence. The
+        # count is taken through _rc_stripped so the answer is the same before the
+        # strip (a dry run) as after it.
+        _unbytes=$(_rc_stripped "$_unf" | wc -c | tr -d ' ')
+        if [ "$_unbytes" = 0 ]; then
+            _un_act "remove $_unf (it holds nothing but the zenv block)" \
+                "removed $_unf (it held nothing but the zenv block)" \
+                rm -f "$_unf"
+        fi
+    done <<EOF
+$_unrcs
+EOF
+
+    # The directory walk is deliberately *not* inside the "was the file there"
+    # test. install.sh's `mkdir -p` ran whether or not the file it was making
+    # room for still exists now, so a completion file or a script you deleted by
+    # hand would otherwise leave its whole empty chain -- ~/.local/share/zsh/
+    # site-functions and up -- behind forever, and nothing would ever look in it
+    # again. _un_rmdirs removes only directories that are empty and stops at the
+    # first one that is not, so the widening costs at worst an empty directory of
+    # your own that any tool needing it will mkdir -p again; leaving zenv's own
+    # chain is the failure this code exists to prevent.
+    for _unf in "$UN_BASH" "$UN_ZSH"; do
+        if [ -f "$_unf" ] || [ -L "$_unf" ]; then
+            _un_act "remove $_unf" "removed $_unf" rm -f "$_unf"
+            _un_gone_add "$_unf"
+        fi
+        _un_rmdirs "${_unf%/*}"
+    done
+
+    # The script goes last, and removing the file a running script was read from
+    # is safe: the open descriptor keeps the inode alive until this exits.
+    if [ -f "$UN_BIN" ] || [ -L "$UN_BIN" ]; then
+        _un_act "remove $UN_BIN" "removed $UN_BIN" rm -f "$UN_BIN"
+        _un_gone_add "$UN_BIN"
+    else
+        _say "  $UN_BIN is not there (nothing installed, or already removed)"
+    fi
+    _un_rmdirs "${UN_BIN%/*}"
+}
+
+# install.sh copies the rc file before its first edit, so the pre-zenv file can
+# be restored byte-for-byte. Once the block is gone that copy is usually
+# redundant -- and a redundant copy is exactly the stray artifact uninstall
+# exists not to leave -- so it goes only when it is byte-identical to what is
+# left. Compared through a pipe rather than as strings, because a difference of
+# nothing but the trailing newline is precisely the case worth keeping.
+_un_backup() {
+    _unb=$1.zenv-pre-install
+    [ -f "$_unb" ] || return 0
+    if _rc_stripped "$1" | cmp -s - "$_unb"; then
+        _un_act "remove $_unb (identical to $1 without the block)" \
+            "removed $_unb (it was identical to $1)" \
+            rm -f "$_unb"
+    else
+        _un_keep "$_unb -- your $1 as it was before zenv, which differs from it now"
+    fi
+}
+
+# True when a directory holds nothing this run has not already removed -- or, in
+# a dry run, would not have removed. The second half is the whole point: during a
+# dry run the files are all still there, so plain emptiness would report that
+# nothing can be tidied and the dry run would understate what the real one does.
+_un_dir_spent() {
+    [ -d "$1" ] || return 1
+    _undl=$(find "$1" -mindepth 1 -maxdepth 1 2>/dev/null)
+    _undok=1
+    while IFS= read -r _unde; do
+        [ -n "$_unde" ] || continue
+        _un_is_gone "$_unde" && continue
+        _undok=
+        break
+    done <<EOF
+$_undl
+EOF
+    [ -n "$_undok" ]
+}
+
+# A directory install.sh created with mkdir -p, and its parents, while each is
+# empty and inside $HOME. A mkdir -p that nothing undoes is how "leaves no trace"
+# quietly becomes false. Both modes walk the same chain and print the same paths,
+# so `--dry-run` names every directory the real run then removes.
+_un_rmdirs() {
+    _unrd=$1
+    while [ -n "$_unrd" ] && [ "$_unrd" != "$HOME" ] && [ "$_unrd" != / ]; do
+        if [ -n "$_UN_DRY" ]; then
+            _un_dir_spent "$_unrd" || return 0
+            _say "  would remove $_unrd (nothing else would be left in it)"
+        else
+            [ -d "$_unrd" ] || return 0
+            rmdir "$_unrd" 2>/dev/null || return 0
+            _say "  removed $_unrd (now empty)"
+        fi
+        _un_gone_add "$_unrd"
+        _unrd=${_unrd%/*}
+    done
+}
+
+# Anything in the root that is not zenv's own metadata: one path per line. An
+# empty directory tree does not count -- that is what an environment whose
+# install was restored leaves behind -- and neither does anything an earlier step
+# has already removed, `config` included: it is added to the gone list before
+# this runs, so it needs no special case here.
+_un_root_leftovers() {
+    for _und in "$ZENV_ROOT_RESOLVED"/*; do
+        [ -e "$_und" ] || [ -L "$_und" ] || continue
+        _un_is_gone "$_und" && continue
+        _un_tree_spent "$_und" && continue
+        printf '%s\n' "$_und"
+    done
+}
+
+# Step 5: the root's own metadata, and then the root itself if what is left in it
+# is only the empty directories zenv made.
+_un_root() {
+    if [ ! -d "$ZENV_ROOT_RESOLVED" ]; then
+        _say "  $ZENV_ROOT_RESOLVED is not there"
+        return 0
+    fi
+    # `config` is zenv's, so it goes whether or not the root can go with it:
+    # nothing reads it once zenv is off the machine, and a file left holding
+    # where two symlinks used to belong is precisely the stray artifact this
+    # command exists to leave none of.
+    _uncfg=$(_config_file)
+    if [ -f "$_uncfg" ]; then
+        _un_act "remove $_uncfg" "removed $_uncfg" rm -f "$_uncfg"
+        _un_gone_add "$_uncfg"
+    fi
+    _unleft=$(_un_root_leftovers)
+    if [ -n "$_unleft" ]; then
+        _un_keep "$ZENV_ROOT_RESOLVED -- kept by what is still in it"
+        while IFS= read -r _unl; do
+            [ -n "$_unl" ] || continue
+            _say "            $_unl"
+        done <<EOF
+$_unleft
+EOF
+        return 0
+    fi
+    # Proved above to hold nothing but empty directories zenv itself made.
+    _un_act "remove $ZENV_ROOT_RESOLVED (nothing of yours is left in it)" \
+        "removed $ZENV_ROOT_RESOLVED" \
+        rm -rf "$ZENV_ROOT_RESOLVED"
+}
+
+cmd_uninstall() {
+    _UN_DRY=
+    _UN_PURGE=
+    _UN_LEFT=
+    _UN_GONE=
+    _UN_BACK=
+    _yes=
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --dry-run | -n) _UN_DRY=1 ;;
+            --purge) _UN_PURGE=1 ;;
+            --yes | -y) _yes=1 ;;
+            -*) _die "uninstall: unknown option '$1'" ;;
+            *) _die "uninstall: unexpected argument '$1'" ;;
+        esac
+        shift
+    done
+
+    _zenv_root
+    _un_paths
+
+    # Nothing to undo is not a failure, and it is asked before anything is
+    # printed. Asking it later would mean prompting "remove zenv from this
+    # machine? [y/N]" of a machine that has none -- and a non-interactive rerun
+    # would then _die on that prompt, so `./uninstall.sh --yes` twice in a
+    # script, or a make target that runs it defensively, would fail on the
+    # second call for having nothing left to do. Exit 0: the requested state is
+    # the state the machine is in.
+    if ! _un_present; then
+        _say "zenv is not installed here, so there is nothing to undo. Looked for:"
+        _say "  $UN_BIN"
+        _say "  $UN_BASH"
+        _say "  $UN_ZSH"
+        _say "  the zenv block in $HOME/.zprofile, .zshrc, .bash_profile, .bashrc, .profile"
+        _say "  the root $ZENV_ROOT_RESOLVED   (from $ZENV_ROOT_SOURCE)"
+        _say ""
+        _say "If zenv is installed somewhere else, ZENV_ROOT=<dir> names another root,"
+        _say "and an install under a different \$HOME has to be removed under that \$HOME."
+        return 0
+    fi
+
+    # The root first, and where it came from: a custom root is the one thing that
+    # changes what "everything" means.
+    if [ -n "$_UN_DRY" ]; then
+        _say "zenv uninstall --dry-run: nothing below is actually done."
+    else
+        _say "zenv uninstall:"
+    fi
+    _say "  root    $ZENV_ROOT_RESOLVED   (from $ZENV_ROOT_SOURCE)"
+    _say "  script  $UN_BIN"
+    _say "  bash    $UN_BASH"
+    _say "  zsh     $UN_ZSH"
+    _say ""
+
+    if [ -z "$_UN_DRY" ] && [ -z "$_yes" ]; then
+        if [ ! -t 0 ]; then
+            _die "uninstall: stdin is not a terminal, so nothing was removed
+      pass --yes to confirm, or --dry-run to see the whole inventory first"
+        fi
+        printf 'zenv: remove zenv from this machine? [y/N] ' >&2
+        IFS= read -r _unans || _unans=
+        case $_unans in
+            y | Y | yes | YES) : ;;
+            *)
+                _say "nothing removed"
+                return 1
+                ;;
+        esac
+        if [ -n "$_UN_PURGE" ]; then
+            printf 'zenv: --purge also deletes every environment. Type purge to confirm: ' >&2
+            IFS= read -r _unans || _unans=
+            if [ "$_unans" != purge ]; then
+                _say "nothing removed"
+                return 1
+            fi
+        fi
+    fi
+
+    _un_links
+    _un_envs
+    _un_files
+    _un_root
+
+    _say ""
+    if [ -n "$_UN_LEFT" ]; then
+        if [ -n "$_UN_DRY" ]; then
+            _say "would still be on this machine:"
+        else
+            _say "still on this machine:"
+        fi
+        printf '%s' "$_UN_LEFT" >&2
+    else
+        if [ -n "$_UN_DRY" ]; then
+            _say "nothing would be left: zenv would remove everything it created."
+        else
+            _say "nothing left: zenv removed everything it created."
+        fi
+    fi
+    _say ""
+    _say "a shell with an environment still active keeps its exported variables until"
+    _say "you run 'zenv deactivate' -- which needs no zenv on disk -- or close it."
+}
+
+# ---------------------------------------------------------------------------
+# doctor -- diagnostics
+#
+# Read-only, and deliberately never runs zkg. Constructing zkg's Manager is
+# itself the hazard of finding 6 -- it moves one state directory's package trees
+# onto another's and deletes the destination -- so a command whose whole job is
+# to *report* that hazard must not create it. Every zkg fact is read from
+# <zkg_dir>/config and <zkg_dir>/manifest.json directly. The only programs it
+# runs are the env's own bin/zeek-config, bin/zeek --version, and the python
+# interpreter of whichever zkg would win on PATH.
+#
+# The exit code is the contract, so `zenv doctor >/dev/null || ...` is usable in
+# a script:
+#
+#   0  clean
+#   1  warnings only -- worth knowing, nothing is broken
+#   2  at least one error -- something will fail, or will destroy state
+#
+# The severity split is that rule applied consistently: a moved install's baked
+# prefix is a warning (it works, while the symlink is there), while a config and
+# manifest that disagree are an error (the next zkg call deletes a directory).
+# ---------------------------------------------------------------------------
+
+_dok() { printf '  ok     %s\n' "$*"; }
+_dinfo() { printf '  info   %s\n' "$*"; }
+_dwarn() {
+    printf '  WARN   %s\n' "$*"
+    _DOC_WARN=1
+}
+_derr() {
+    printf '  ERROR  %s\n' "$*"
+    _DOC_ERR=1
+}
+# A continuation line, aligned under a finding's text.
+_dmore() { printf '         %s\n' "$*"; }
+
+# The env whose <key> directory resolves to <path>, if any. Used to name the env
+# a symlink points at; _owner_env answers the different question of which env
+# *contains* a path.
+_dir_env() {
+    for _dren in $(_each_env); do
+        [ "$(_resolve_soft "$(_env_get "$_dren" "$2")")" = "$1" ] || continue
+        printf '%s' "$_dren"
+        return 0
+    done
+    return 1
+}
+
+cmd_doctor() {
+    _dname=
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --all) _dname= ;;
+            -*) _die "doctor: unknown option '$1'" ;;
+            *)
+                [ -z "$_dname" ] \
+                    || _die "doctor: only one name, got '$_dname' and '$1'"
+                _dname=$1
+                ;;
+        esac
+        shift
+    done
+
+    _DOC_WARN=0
+    _DOC_ERR=0
+    _zenv_root
+
+    _doctor_root
+    if [ -n "$_dname" ]; then
+        _require_env "$_dname"
+        _doctor_env "$_dname"
+    else
+        _dnames=$(_each_env)
+        if [ -z "$_dnames" ]; then
+            printf '\nenvironments\n'
+            _dinfo "none yet -- 'zenv new <name>' creates one"
+        else
+            for _dcn in $_dnames; do
+                _doctor_env "$_dcn"
+            done
+        fi
+    fi
+
+    printf '\n'
+    if [ "$_DOC_ERR" = 1 ]; then
+        printf 'doctor: errors found -- fix those first\n'
+        return 2
+    fi
+    if [ "$_DOC_WARN" = 1 ]; then
+        printf 'doctor: warnings only, nothing broken\n'
+        return 1
+    fi
+    printf 'doctor: all checks passed\n'
+    return 0
+}
+
+_doctor_root() {
+    printf 'zenv %s\n' "$ZENV_VERSION"
+    if [ -d "$ZENV_ROOT_RESOLVED" ]; then
+        _dok "root: $ZENV_ROOT_RESOLVED (from the $ZENV_ROOT_SOURCE)"
+    else
+        _dinfo "root: $ZENV_ROOT_RESOLVED (from the $ZENV_ROOT_SOURCE) -- not created yet"
+    fi
+
+    # ZEEK_BUILD_DIR is the one of the two that CMake really does read from the
+    # environment (ZeekPlugin.cmake reads ENV{ZEEK_BUILD_DIR}), and it silently
+    # overrides the tree for any package that passes --zeek-dist.
+    if [ -n "${ZEEK_BUILD_DIR+set}" ]; then
+        _dwarn "ZEEK_BUILD_DIR is set in your environment: ${ZEEK_BUILD_DIR}"
+        _dmore "any package built with --zeek-dist uses that build directory instead of"
+        _dmore "the tree it was told about. zenv never sets it; unset it unless you mean it"
+    else
+        _dok "ZEEK_BUILD_DIR is not set"
+    fi
+    if [ -n "${ZEEK_DIST+set}" ]; then
+        _dinfo "ZEEK_DIST is set in your environment: ${ZEEK_DIST}"
+        _dmore "nothing reads it from the environment -- CMake takes ZEEK_DIST only as a"
+        _dmore "variable -- so it has no effect. zenv neither sets nor removes it"
+    fi
+
+    if [ -n "${ZENV:-}" ]; then
+        if _env_exists "$ZENV"; then
+            _dok "this shell has '$ZENV' active"
+        else
+            _dwarn "this shell has ZENV='$ZENV' active, but there is no such environment"
+            _dmore "it was probably removed while active; 'zenv deactivate' clears it"
+        fi
+    else
+        _dinfo "no environment is active in this shell"
+    fi
+
+    _doctor_links
+    _doctor_collisions
+}
+
+_doctor_links() {
+    printf '\nsystem-default symlinks\n'
+    for _dlk in zeek zkg; do
+        case $_dlk in
+            zeek) _dlkey=prefix ;;
+            *) _dlkey=zkg_dir ;;
+        esac
+        _dlp=$(_link_path "$_dlk")
+        _link_state "$_dlp"
+        case $_LINK_STATE in
+            missing)
+                _dinfo "$_dlp: nothing there"
+                ;;
+            dir)
+                _dinfo "$_dlp: a real directory zenv did not create"
+                _dmore "'zenv adopt <name>' registers it as an environment"
+                ;;
+            other)
+                _dwarn "$_dlp: exists and is neither a directory nor a symlink"
+                ;;
+            symlink)
+                _dld=$(_link_dest "$_dlp" "$_LINK_TARGET")
+                _dldr=$(_resolve_soft "$_dld")
+                if [ ! -e "$_dld" ]; then
+                    _dwarn "$_dlp -> $_LINK_TARGET dangles (nothing at $_dld)"
+                    _dmore "'zenv link <name>' repoints it, 'zenv unlink' removes it"
+                elif _under "$_dldr" "$ZENV_ROOT_RESOLVED"; then
+                    _dlname=$(_dir_env "$_dldr" "$_dlkey") || _dlname=
+                    if [ -n "$_dlname" ]; then
+                        _dok "$_dlp -> $_LINK_TARGET (environment '$_dlname')"
+                        if [ -n "${ZENV:-}" ] && [ "$ZENV" != "$_dlname" ]; then
+                            _dinfo "  this shell has '$ZENV' active instead"
+                            _dmore "harmless -- activation is shell-local -- but anything that"
+                            _dmore "hardcodes $_dlp sees '$_dlname'"
+                        fi
+                    else
+                        _dwarn "$_dlp -> $_LINK_TARGET points into the root but at no environment"
+                    fi
+                else
+                    _dinfo "$_dlp -> $_LINK_TARGET (outside the root; zenv did not create it)"
+                fi
+                ;;
+        esac
+    done
+}
+
+# Two envs whose zkg configs name one directory is the collision that makes
+# finding 6 reachable at all: whichever runs second adopts the first's packages
+# by deleting them. Checked across every env, whatever env doctor was asked about.
+_doctor_collisions() {
+    printf '\nshared directories between environments\n'
+    _dcnames=$(_each_env)
+    if [ -z "$_dcnames" ]; then
+        _dinfo "nothing to compare"
+        return 0
+    fi
+    _dcfound=0
+    for _dckey in script_dir plugin_dir; do
+        _dcseen=
+        for _dca in $_dcnames; do
+            _dcav=$(_ini_get "$(_env_get "$_dca" zkg_dir)/config" "$_dckey" 2>/dev/null) \
+                || _dcav=
+            [ -n "$_dcav" ] || continue
+            _dcav=$(_resolve_soft "$_dcav")
+            for _dcb in $_dcnames; do
+                [ "$_dcb" = "$_dca" ] && continue
+                # Each unordered pair once: only look forward.
+                case $_dcseen in
+                    *" $_dcb:$_dca "*) continue ;;
+                esac
+                _dcbv=$(_ini_get "$(_env_get "$_dcb" zkg_dir)/config" "$_dckey" 2>/dev/null) \
+                    || _dcbv=
+                [ -n "$_dcbv" ] || continue
+                [ "$(_resolve_soft "$_dcbv")" = "$_dcav" ] || continue
+                _dcseen="$_dcseen $_dca:$_dcb "
+                _dcfound=1
+                _derr "'$_dca' and '$_dcb' both use $_dckey = $_dcav"
+                _dmore "one zkg call in either environment moves the other's packages onto"
+                _dmore "its own and deletes the destination. Reinstall one of them with"
+                _dmore "--prefix=\$(zenv prefix <name>) so each has its own directories"
+            done
+        done
+    done
+    [ "$_dcfound" = 0 ] && _dok "no two environments share a script_dir or plugin_dir"
+    return 0
+}
+
+_doctor_env() {
+    _den=$1
+    printf '\nenvironment %s\n' "$_den"
+
+    _dep=$(_env_get "$_den" prefix)
+    _dez=$(_env_get "$_den" zkg_dir)
+    _depr=$(_resolve_soft "$_dep")
+    _dezr=$(_resolve_soft "$_dez")
+
+    # 1. Layout. Metadata beside the prefix, never inside it, so a `make install`
+    #    into the prefix can never collide with zenv's own bookkeeping.
+    if [ -d "$_dep" ]; then
+        _dok "prefix: $_depr"
+    else
+        _derr "prefix directory is missing: $_dep"
+        _dmore "'zenv new $_den' made it; something removed it since"
+    fi
+    if [ -d "$_dez" ]; then
+        _dok "zkg directory: $_dezr"
+    else
+        _dwarn "zkg directory is missing: $_dez"
+        _dmore "'zenv autoconfig $_den' recreates it. Until it exists, zkg's ZEEK_ZKG_*"
+        _dmore "overrides are ignored and zkg falls back to ~/.zkg"
+    fi
+
+    # 2. Is anything installed? An env with nothing built yet is a normal state,
+    #    not a fault -- that is the whole point of `zenv new` followed by your own
+    #    build -- so it is informational and the install checks are skipped.
+    _dezc=$_dep/bin/zeek-config
+    if [ ! -x "$_dezc" ]; then
+        _dinfo "nothing installed at $_depr yet"
+        _dmore "install Zeek there with --prefix=$_depr, then run 'zenv autoconfig $_den'"
+        _doctor_zkg_config "$_den" "$_depr" "$_dezr" ''
+        return 0
+    fi
+
+    _dever=$("$_dezc" --version 2>/dev/null) || _dever=
+    [ -n "$_dever" ] || _dever='?'
+    _dok "installed: $_dever"
+
+    # 3. The baked prefix (finding 1). Compile-time absolute constants and an
+    #    absolute LC_RPATH mean the install knows where it was configured to live.
+    _debaked=$("$_dezc" --prefix 2>/dev/null) || _debaked=
+    if [ -z "$_debaked" ]; then
+        _dwarn "$_dezc --prefix printed nothing"
+    elif [ "$(_resolve_soft "$_debaked")" = "$_depr" ]; then
+        if [ "$_debaked" = "$_depr" ]; then
+            _dok "baked prefix: $_debaked"
+        else
+            _dwarn "baked prefix is $_debaked, not $_depr"
+            _dmore "it resolves here, so this install works *through* that path -- the"
+            _dmore "signature of 'zenv adopt --move'. 'zenv link $_den' is therefore"
+            _dmore "required, not optional, until you reinstall with --prefix=$_depr"
+        fi
+    else
+        _derr "baked prefix is $_debaked, which is not this environment's directory"
+        _dmore "expected: $_depr"
+        _dmore "scripts, plugins and the runtime library path are all baked absolutely,"
+        _dmore "so this install serves another prefix. Reinstall it with --prefix=$_depr"
+        _deowner=$(_owner_env "$(_resolve_soft "$_debaked")") || _deowner=
+        [ -n "$_deowner" ] \
+            && _dmore "that path belongs to environment '$_deowner'"
+    fi
+
+    # 4. Completeness (finding 8). An install can be missing its subproject
+    #    headers and libraries while `zeek --version` still works, so "zeek runs"
+    #    is not evidence that packages can be built against it.
+    _debroker=$("$_dezc" --broker_root 2>/dev/null) || _debroker=
+    if [ -n "$_debroker" ]; then
+        if [ -d "$_debroker/include/broker" ]; then
+            _dok "subproject headers: $_debroker/include/broker"
+        else
+            _derr "$_debroker/include/broker is missing"
+            _dmore "'zeek --version' still works without it, but building any native"
+            _dmore "package fails with 'broker/expected.hh' not found. Reinstall this"
+            _dmore "environment's Zeek into $_depr to restore it"
+        fi
+    fi
+    _deinc=$("$_dezc" --include_dir 2>/dev/null) || _deinc=
+    if [ -n "$_deinc" ]; then
+        _defirst=${_deinc%%:*}
+        [ -d "$_defirst" ] \
+            || _dwarn "include dir does not exist: $_defirst"
+    fi
+
+    # 5. Does it run? The absolute LC_RPATH has to still resolve.
+    if [ -x "$_dep/bin/zeek" ]; then
+        if "$_dep/bin/zeek" --version >/dev/null 2>&1; then
+            _dok "$_dep/bin/zeek --version runs"
+        else
+            _derr "$_dep/bin/zeek will not run"
+            _dmore "its runtime library path is absolute, so a moved or half-removed"
+            _dmore "install fails here while zeek-config still answers"
+        fi
+    else
+        _dwarn "no zeek binary at $_dep/bin/zeek, though zeek-config is there"
+    fi
+
+    # 6. zkg's wiring, read from the files -- never by running zkg.
+    _doctor_zkg_config "$_den" "$_depr" "$_dezr" "$_dezc"
+
+    # 7. Source-tree drift (findings 5 and 5b).
+    _dedist=$("$_dezc" --zeek_dist 2>/dev/null) || _dedist=
+    _dist_tree "$_den" "$_dedist"
+    _dist_state "$_DIST_TREE" "$_dever"
+    case $_DIST_STATE in
+        verified)
+            _dok "source tree: $_DIST_TREE (verified -- $_DIST_WHY)"
+            _doctor_build_commit "$_den" "$_DIST_TREE" "$_dever" info
+            ;;
+        drifted)
+            _dwarn "source tree has drifted: $_DIST_WHY"
+            _dmore "the two index packages that pass %(zeek_dist)s to --zeek-dist would"
+            _dmore "build against those sources and fail the version guard at dlopen."
+            _dmore "'zenv autoconfig $_den' writes the key empty rather than stale"
+            _doctor_build_commit "$_den" "$_DIST_TREE" "$_dever" warn
+            ;;
+        *) _dinfo "source tree: $_DIST_STATE -- $_DIST_WHY" ;;
+    esac
+
+    # 8. Which zkg a command in this environment would reach.
+    _doctor_zkg_binary "$_den" "$_dep"
+}
+
+# Which commit the source tree is on, against the one the environment was built
+# from. This is the check that makes a shared checkout manageable: version
+# matching alone cannot tell you *which* commit to go back to.
+#
+# _doctor_build_commit <name> <tree> <installed version> <info|warn>. The last
+# argument is the severity for a tree that is checked out elsewhere: a warning
+# when the tree has already drifted, information when it still verifies, so an
+# otherwise-clean environment does not start failing doctor's exit code because
+# a shared tree moved to another commit of the same version.
+# _dbsay <info|warn> <line>. A tree checked out elsewhere only counts against
+# doctor's exit code when the install has already drifted from it.
+_dbsay() {
+    if [ "$1" = warn ]; then
+        _dwarn "$2"
+    else
+        _dinfo "$2"
+    fi
+}
+
+_doctor_build_commit() {
+    _dbn=$1
+    _dbt=$2
+    _dbver=$3
+    _dbsev=$4
+
+    _dist_commit "$_dbt"
+    _dbwant=$(_env_get "$_dbn" src_commit 2>/dev/null) || _dbwant=
+    _dbwantver=$(_env_get "$_dbn" src_version 2>/dev/null) || _dbwantver=
+
+    if [ -z "$_DIST_HEAD" ]; then
+        # A tarball or an export: nothing to compare, and nothing wrong with it.
+        [ -n "$_dbwant" ] \
+            && _dinfo "build commit $(_short_sha "$_dbwant") is recorded, but $_dbt is not a git checkout"
+        return 0
+    fi
+    if [ -z "$_dbwant" ]; then
+        _dinfo "no build commit recorded for '$_dbn'; $_dbt is on $(_short_sha "$_DIST_HEAD")"
+        _dmore "'zenv autoconfig $_dbn' records it while the tree still matches the"
+        _dmore "install, and then activation can name the commit to check out again"
+        return 0
+    fi
+    if [ "$_dbwantver" != "$_dbver" ]; then
+        _dinfo "build commit $(_short_sha "$_dbwant") was recorded for '$_dbwantver', this install is '$_dbver'"
+        _dmore "so it is no longer evidence about this install -- re-run"
+        _dmore "'zenv autoconfig $_dbn' to record what it really came from"
+        return 0
+    fi
+    if [ "$_dbwant" = "$_DIST_HEAD" ]; then
+        _dok "build commit: $_dbt is on $(_short_sha "$_DIST_HEAD"), the commit '$_dbn' was built from"
+        return 0
+    fi
+    if ! _dist_has_commit "$_dbt" "$_dbwant"; then
+        _dbsay "$_dbsev" \
+            "'$_dbn' was built from $(_short_sha "$_dbwant"), a commit $_dbt does not have"
+        _dmore "fetch it, or rebuild and re-run 'zenv autoconfig $_dbn'"
+        return 0
+    fi
+    _dbsay "$_dbsev" \
+        "$_dbt is on $(_short_sha "$_DIST_HEAD"), but '$_dbn' was built from $(_short_sha "$_dbwant")"
+    _dmore "git -C $_dbt checkout $_dbwant"
+    _dmore "puts it back. Only a package build that passes --zeek-dist reads that"
+    _dmore "tree, so nothing else in this environment is affected"
+}
+
+# The zkg config and manifest checks. <zeek-config> is empty when nothing is
+# installed, in which case the config's directories cannot be checked against an
+# install and only state_dir is verifiable.
+_doctor_zkg_config() {
+    _dzn=$1
+    _dzp=$2
+    _dzz=$3
+    _dzzc=$4
+
+    _dzcfg=$_dzz/config
+    if [ ! -f "$_dzcfg" ]; then
+        if [ -n "$_dzzc" ]; then
+            _dwarn "zkg is not wired up yet: no config at $_dzcfg"
+            _dmore "run 'zenv autoconfig $_dzn'. Until then zkg falls back to its"
+            _dmore "in-memory defaults, which are self-contained inside the state"
+            _dmore "directory -- harmless, but not this install's site and plugin dirs"
+        else
+            _dinfo "no zkg config at $_dzcfg yet (nothing installed to wire it to)"
+        fi
+        return 0
+    fi
+
+    _dzsd=$(_ini_get "$_dzcfg" state_dir 2>/dev/null) || _dzsd=
+    if [ "$(_resolve_soft "$_dzsd")" = "$_dzz" ]; then
+        _dok "zkg state_dir: $_dzsd"
+    else
+        _derr "zkg state_dir is $_dzsd, not $_dzz"
+        _dmore "every zkg call in this environment reads and writes that directory"
+        _dmore "instead of its own. 'zenv autoconfig $_dzn' rewrites the key"
+    fi
+
+    # script_dir, plugin_dir and bin_dir must all name this install. A config
+    # pointing at another env's directories is exactly what makes one zkg call
+    # delete that env's packages.
+    _dzs=$(_ini_get "$_dzcfg" script_dir 2>/dev/null) || _dzs=
+    _dzpl=$(_ini_get "$_dzcfg" plugin_dir 2>/dev/null) || _dzpl=
+    _dzb=$(_ini_get "$_dzcfg" bin_dir 2>/dev/null) || _dzb=
+    for _dzkey in script_dir plugin_dir bin_dir; do
+        case $_dzkey in
+            script_dir) _dzv=$_dzs ;;
+            plugin_dir) _dzv=$_dzpl ;;
+            *) _dzv=$_dzb ;;
+        esac
+        if [ -z "$_dzv" ]; then
+            _dwarn "zkg $_dzkey is empty in $_dzcfg"
+            continue
+        fi
+        _dzvr=$(_resolve_soft "$_dzv")
+        if _under "$_dzvr" "$_dzp"; then
+            _dok "zkg $_dzkey: $_dzv"
+        else
+            _derr "zkg $_dzkey is outside this environment's prefix: $_dzv"
+            _dmore "prefix: $_dzp"
+            _dzowner=$(_owner_env "$_dzvr") || _dzowner=
+            if [ -n "$_dzowner" ]; then
+                _dmore "that directory belongs to environment '$_dzowner', whose installed"
+                _dmore "packages one zkg call in '$_dzn' would move and then delete"
+            fi
+            _dmore "reinstall with --prefix=$_dzp, then 'zenv autoconfig $_dzn'"
+        fi
+    done
+
+    _dzdist=$(_ini_get "$_dzcfg" zeek_dist 2>/dev/null) || _dzdist=
+    if [ -z "$_dzdist" ]; then
+        _dinfo "zkg zeek_dist is empty -- irrelevant to all but two index packages"
+    else
+        _dinfo "zkg zeek_dist: $_dzdist"
+    fi
+
+    # The relocation trap itself, the highest-severity check there is. zkg's
+    # Manager appends /packages to the config's script_dir and plugin_dir and
+    # compares the result with the manifest by realpath; a disagreement is not
+    # reported by zkg, it is "repaired" by moving one onto the other and deleting
+    # the destination.
+    _dzman=$_dzz/manifest.json
+    if [ ! -f "$_dzman" ]; then
+        _dinfo "no manifest.json yet (no package has been installed in this environment)"
+        return 0
+    fi
+    _dzbad=
+    for _dzkey in script_dir plugin_dir bin_dir; do
+        if ! _dzgot=$(_manifest_get "$_dzman" "$_dzkey" 2>/dev/null); then
+            _derr "cannot read $_dzman as JSON"
+            _dmore "zkg rewrites it on every install; a truncated one makes the next"
+            _dmore "zkg call fail. Restore it from a backup, or remove it to start over"
+            return 0
+        fi
+        case $_dzkey in
+            script_dir) _dzwant=$_dzs/packages ;;
+            plugin_dir) _dzwant=$_dzpl/packages ;;
+            *) _dzwant=$_dzb ;;
+        esac
+        [ "$(_resolve_soft "$_dzgot")" = "$(_resolve_soft "$_dzwant")" ] && continue
+        _dzbad=1
+        _derr "manifest.json disagrees with the config about $_dzkey"
+        _dmore "manifest: $_dzgot"
+        _dmore "config:   $_dzwant"
+    done
+    if [ -n "$_dzbad" ]; then
+        _dmore "the next zkg call -- any zkg call, including 'zkg list' -- moves one of"
+        _dmore "those onto the other and deletes the destination, contents and all."
+        _dmore "'zenv autoconfig $_dzn --fix-paths' rewrites the manifest first"
+    else
+        _dok "manifest.json agrees with the config"
+    fi
+    return 0
+}
+
+# Which zkg wins, and whether its interpreter can actually import what it needs:
+# the bundled one is `#!/usr/bin/env python3` and hard-fails without GitPython
+# and semantic_version.
+_doctor_zkg_binary() {
+    _dbn=$1
+    _dbp=$2
+
+    _dbown=
+    [ -x "$_dbp/bin/zkg" ] && _dbown=$_dbp/bin/zkg
+    _dbfirst=$(command -v zkg 2>/dev/null) || _dbfirst=
+
+    if [ -n "$_dbown" ]; then
+        _dok "zkg: $_dbown (this environment's own)"
+        _dbuse=$_dbown
+    elif [ -n "$_dbfirst" ]; then
+        _dinfo "zkg: $_dbfirst (from PATH -- this environment bundles none)"
+        _dmore "activation exports ZKG_CONFIG_FILE and both ZEEK_ZKG_* variables, so"
+        _dmore "even another install's zkg reads this environment's state"
+        _dbuse=$_dbfirst
+    else
+        _dwarn "no zkg found: neither $_dbp/bin/zkg nor one on PATH"
+        _dmore "'zenv autoconfig $_dbn' needs one"
+        return 0
+    fi
+
+    if [ -n "$_dbfirst" ] && [ -n "$_dbown" ] \
+        && [ "$(_resolve_soft "$_dbfirst")" != "$(_resolve_soft "$_dbown")" ]; then
+        if [ "${ZENV:-}" = "$_dbn" ]; then
+            _dwarn "but 'zkg' on this shell's PATH is $_dbfirst"
+            _dmore "'$_dbn' is active, so its own bin should come first -- something"
+            _dmore "prepended to PATH after activation"
+        else
+            _dinfo "'zkg' on this shell's PATH is $_dbfirst (no environment active here)"
+        fi
+    fi
+
+    # The interpreter comes from the script's own shebang, which is what the
+    # kernel would use. `env python3` means whichever python3 PATH finds.
+    _dbshb=
+    IFS= read -r _dbshb <"$_dbuse" 2>/dev/null || _dbshb=
+    case $_dbshb in
+        '#!'*) _dbshb=${_dbshb#'#!'} ;;
+        *) _dbshb= ;;
+    esac
+    _dbshb=$(_trim "$_dbshb")
+    _dbinterp=${_dbshb%% *}
+    _dbrest=
+    case $_dbshb in
+        *' '*) _dbrest=${_dbshb#* } ;;
+    esac
+    case ${_dbinterp##*/} in
+        env)
+            _dbinterp=${_dbrest%% *}
+            _dbinterp=$(command -v "$_dbinterp" 2>/dev/null) || _dbinterp=
+            ;;
+    esac
+    case ${_dbinterp##*/} in
+        python*) : ;;
+        *)
+            _dinfo "cannot tell which python $_dbuse uses, so its imports were not checked"
+            return 0
+            ;;
+    esac
+
+    if "$_dbinterp" -c 'import git, semantic_version' >/dev/null 2>&1; then
+        _dok "$_dbinterp can import git and semantic_version"
+    else
+        _derr "$_dbinterp cannot import git and semantic_version"
+        _dmore "$_dbuse hard-fails without them, so 'zenv autoconfig $_dbn' and every"
+        _dmore "zkg command in this environment will fail"
+        _dmore "install them for that interpreter: GitPython and semantic-version"
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# status -- what activation would do, without doing it
+#
+# The variable list is produced by evaluating `zenv shell activate`'s own output
+# in a subshell and dumping the result, the same trick `zenv exec` uses. So the
+# two can never drift: if activation sets it, status shows it, and it shows the
+# values this shell would actually get, PATH surgery included.
+# ---------------------------------------------------------------------------
+
+STATUS_VARS='ZENV ZENV_PREFIX ZENV_ZKG_DIR PATH PYTHONPATH MANPATH ZEEKPATH ZEEK_PLUGIN_PATH ZKG_CONFIG_FILE ZEEK_ZKG_CONFIG_DIR ZEEK_ZKG_STATE_DIR'
+
+cmd_status() {
+    _sname=
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -*) _die "status: unknown option '$1'" ;;
+            *)
+                [ -z "$_sname" ] \
+                    || _die "status: only one name, got '$_sname' and '$1'"
+                _sname=$1
+                ;;
+        esac
+        shift
+    done
+    _sname=$(_target_env "$_sname")
+    # _target_env resolved the root inside a command substitution, so this
+    # process still has to do it for itself before reporting it.
+    _zenv_root
+
+    _spfx=$(_resolve_soft "$(_env_get "$_sname" prefix)")
+    _szkg=$(_resolve_soft "$(_env_get "$_sname" zkg_dir)")
+
+    printf 'name:       %s\n' "$_sname"
+    printf 'root:       %s (from the %s)\n' "$ZENV_ROOT_RESOLVED" "$ZENV_ROOT_SOURCE"
+    printf 'prefix:     %s\n' "$_spfx"
+    printf 'zkg dir:    %s\n' "$_szkg"
+    for _skey in src src_commit src_version created; do
+        _sv=$(_env_get "$_sname" "$_skey" 2>/dev/null) || _sv=
+        [ -n "$_sv" ] && printf '%-11s %s\n' "$_skey:" "$_sv"
+    done
+
+    _szc=$_spfx/bin/zeek-config
+    if [ -x "$_szc" ]; then
+        _sver=$("$_szc" --version 2>/dev/null) || _sver='?'
+        printf 'installed:  %s\n' "${_sver:-?}"
+    else
+        printf 'installed:  no -- nothing at %s yet\n' "$_spfx"
+    fi
+
+    # The shared-source-tree reminder, reported here as well as on activation so
+    # `zenv status` is a complete picture of what that environment would say.
+    _dist_reminder "$_sname" "$_spfx"
+    if [ -n "$_REMIND" ]; then
+        printf 'reminder:   %s\n' "$_REMIND"
+    fi
+
+    if [ "${ZENV:-}" = "$_sname" ]; then
+        printf 'active:     yes, in this shell\n'
+    else
+        printf 'active:     no'
+        [ -n "${ZENV:-}" ] && printf " (this shell has '%s')" "$ZENV"
+        printf '\n'
+    fi
+
+    for _slk in zeek zkg; do
+        case $_slk in
+            zeek) _slkey=prefix ;;
+            *) _slkey=zkg_dir ;;
+        esac
+        _slp=$(_link_path "$_slk")
+        _link_state "$_slp"
+        case $_LINK_STATE in
+            symlink)
+                _sld=$(_resolve_soft "$(_link_dest "$_slp" "$_LINK_TARGET")")
+                _slname=$(_dir_env "$_sld" "$_slkey") || _slname=
+                if [ "$_slname" = "$_sname" ]; then
+                    printf 'linked:     %s -> %s (this environment)\n' "$_slp" "$_LINK_TARGET"
+                elif [ -n "$_slname" ]; then
+                    printf "linked:     %s -> %s (environment '%s')\\n" \
+                        "$_slp" "$_LINK_TARGET" "$_slname"
+                else
+                    printf 'linked:     %s -> %s\n' "$_slp" "$_LINK_TARGET"
+                fi
+                ;;
+            dir) printf 'linked:     %s is a real directory, not a symlink\n' "$_slp" ;;
+            *) printf 'linked:     %s: nothing there\n' "$_slp" ;;
+        esac
+    done
+
+    # zkg's own view, read from the config file. Running `zkg config` to ask it
+    # would construct the Manager that finding 6 warns about, so status does not.
+    printf '\nzkg config: %s' "$_szkg/config"
+    if [ -f "$_szkg/config" ]; then
+        printf '\n'
+        for _skey in state_dir script_dir plugin_dir bin_dir zeek_dist; do
+            _sv=$(_ini_get "$_szkg/config" "$_skey" 2>/dev/null) || _sv=
+            printf '  %-11s %s\n' "$_skey" "$_sv"
+        done
+        _sdist=$(_ini_get "$_szkg/config" zeek_dist 2>/dev/null) || _sdist=
+        if [ -n "$_sdist" ] && [ -x "$_szc" ]; then
+            _dist_state "$_sdist" "$("$_szc" --version 2>/dev/null)"
+            printf '  %-11s %s (%s)\n' 'zeek_dist' "$_DIST_STATE" "$_DIST_WHY"
+        fi
+    else
+        printf ' (not wired up yet -- run '\''zenv autoconfig %s'\'')\n' "$_sname"
+    fi
+    printf '  packages    %s\n' "$(_manifest_count "$_szkg/manifest.json" || printf '%s' '-')"
+
+    printf '\nvariables activation sets in this shell\n'
+    # The reminder is suppressed here only because status printed it already,
+    # above, where it reads as part of the report rather than as a warning.
+    # shellcheck disable=SC2030
+    #   Local to this subshell is exactly what is wanted: the suppression covers
+    #   the activation being computed for the dump, and must not outlive it.
+    _scode=$(
+        ZENV_DISABLE_REMINDER=1
+        export ZENV_DISABLE_REMINDER
+        cmd_shell_activate --no-autoconfig "$_sname"
+    ) || _die "cannot compute the environment for '$_sname'"
+    # The subshell's own ZENV_DISABLE_PROMPT is deliberately local to it: status
+    # reports the variables, so the activation it evals must not touch a PS1 that
+    # is only going to be discarded. The check below is about *your* setting, and
+    # reads the caller's value on purpose.
+    # shellcheck disable=SC2030
+    _sdump=$(
+        ZENV_DISABLE_PROMPT=1
+        export ZENV_DISABLE_PROMPT
+        eval "$_scode"
+        for _v in $STATUS_VARS; do
+            eval "_isset=\${$_v+set}"
+            eval "_val=\${$_v-}"
+            if [ -n "${_isset:-}" ]; then
+                printf '  %-20s %s\n' "$_v" "${_val-}"
+            else
+                printf '  %-20s <unset>\n' "$_v"
+            fi
+        done
+    )
+    printf '%s\n' "$_sdump"
+    # shellcheck disable=SC2031  # the assignment above was scoped to that subshell, as intended
+    if [ -z "${ZENV_DISABLE_PROMPT:-}" ]; then
+        printf '  %-20s %s\n' PS1 "(zenv:$_sname) \$PS1"
+    else
+        printf '  %-20s unchanged (ZENV_DISABLE_PROMPT is set)\n' PS1
+    fi
+
+    printf '\nZEEK_DIST and ZEEK_BUILD_DIR are left exactly as they are:\n'
+    printf '  ZEEK_DIST       %s\n' "${ZEEK_DIST-<unset>}"
+    printf '  ZEEK_BUILD_DIR  %s\n' "${ZEEK_BUILD_DIR-<unset>}"
+    printf "\nnote: 'zkg --user' ignores every one of those variables and uses ~/.zkg.\n"
+}
+
+# ---------------------------------------------------------------------------
+# Emitted shell code
+#
+# `zenv shell activate <name>` writes POSIX shell code to stdout and nothing
+# else; every diagnostic goes to stderr. A failure therefore exits non-zero
+# having written nothing evaluable, so a half-applied environment is impossible.
+#
+# Six variables are overwritten outright -- ZEEKPATH, ZEEK_PLUGIN_PATH,
+# ZKG_CONFIG_FILE, ZEEK_ZKG_CONFIG_DIR, ZEEK_ZKG_STATE_DIR and PS1 -- and each is
+# saved through a _ZENV_HAD_<VAR>/_ZENV_OLD_<VAR>/_ZENV_EXP_<VAR> triple, so
+# deactivate can tell *unset* from *empty* and set-but-not-exported from
+# exported. PATH, PYTHONPATH and MANPATH are *recomputed* on the way out instead,
+# so an entry you add while an environment is active survives deactivation; they
+# carry the same saved triple, with the value used only when the recomputation
+# leaves nothing but separators and there is therefore nothing of yours to keep.
+#
+# The save is guarded by "not already saved", so activating b while a is active
+# still restores the pre-zenv values, not a's.
+#
+# ZEEK_DIST and ZEEK_BUILD_DIR are deliberately absent. Nothing reads the first
+# from the environment and a stale value of either is a trap, so zenv neither
+# reads nor writes them -- an existing value of either is left exactly as it is.
+# ---------------------------------------------------------------------------
+
+# _emit_save <VAR> [indent]. Saves three things: whether the variable was set,
+# its value, and whether it was *exported*.
+#
+# Set-ness and the value have to be decided by the emitted code, because a
+# variable that is set but not exported (zsh gives every shell a MANPATH and a
+# PS1 like that) is invisible to zenv. Exportedness is the other way round: zenv
+# is a child process, so it sees exactly the exported variables and nothing else.
+# That single fact is baked in here as a constant.
+#
+# It matters because there is no portable way to *remove* the export attribute:
+# activation exports what it sets, so without this an unexported MANPATH would
+# come back exported and every child of the shell would see it -- which the
+# env-diff test in tests/test_shell.sh catches.
+_emit_save() {
+    _esi=${2:-}
+    eval "_esexp=\${$1+1}"
+    [ -n "$_esexp" ] || _esexp=0
+    printf '%sif [ -z "${_ZENV_HAD_%s+s}" ]; then\n' "$_esi" "$1"
+    printf '%s  if [ -n "${%s+s}" ]; then _ZENV_HAD_%s=1; _ZENV_OLD_%s=$%s\n' \
+        "$_esi" "$1" "$1" "$1" "$1"
+    printf '%s  else _ZENV_HAD_%s=0; _ZENV_OLD_%s=; fi\n' "$_esi" "$1" "$1"
+    printf '%s  _ZENV_EXP_%s=%s\n' "$_esi" "$1" "$_esexp"
+    printf '%sfi\n' "$_esi"
+}
+
+# Restore a variable to a value, exported or not as it was.
+#
+# Dropping the export attribute takes three tries because no one way covers every
+# shell: `unset` clears it in a POSIX shell, but zsh's tied parameters (MANPATH is
+# one, and zsh gives every shell an unexported empty MANPATH) keep it across an
+# unset and a reassignment, and zsh has no `export -n` while bash 3.2 has no
+# `typeset -g`. Each attempt is allowed to fail; between them they cover sh, bash
+# and zsh, and the final `:` keeps a shell without any of them quiet.
+#
+# _emit_assign <VAR> <shell expression for the value> <indent>
+_emit_assign() {
+    printf '%sif [ "${_ZENV_EXP_%s-1}" = 1 ]; then %s=%s; export %s\n' \
+        "${3:-}" "$1" "$1" "$2" "$1"
+    printf '%selse _zenv_v=%s; unset %s; %s=$_zenv_v; unset _zenv_v\n' \
+        "${3:-}" "$2" "$1" "$1"
+    printf '%s    export -n %s 2>/dev/null || typeset +x -g %s 2>/dev/null || :\n' \
+        "${3:-}" "$1" "$1"
+    printf '%sfi\n' "${3:-}"
+}
+
+_emit_export() { printf '%s=%s; export %s\n' "$1" "$(_shq "$2")" "$1"; }
+
+# A newline-separated list rendered as quoted shell words, for `for x in ...`.
+_emit_words() {
+    _ewrest=$1
+    while [ -n "$_ewrest" ]; do
+        case $_ewrest in
+            *"$NL"*)
+                _ew=${_ewrest%%"$NL"*}
+                _ewrest=${_ewrest#*"$NL"}
+                ;;
+            *)
+                _ew=$_ewrest
+                _ewrest=
+                ;;
+        esac
+        [ -n "$_ew" ] || continue
+        printf ' %s' "$(_shq "$_ew")"
+    done
+}
+
+# The shell-side twin of _path_strip, emitted so a deactivating shell needs no
+# zenv on disk. One directory per call, passed as a quoted word, so a path
+# containing a space or a quote needs no separator convention at all.
+# tests/test_shell.sh runs the whole PATH hazard table through both and requires
+# identical answers, which is what keeps the two from drifting.
+_emit_strip_fn() {
+    cat <<'EOF'
+_zenv_strip() {
+    _zs_v=$1
+    _zs_d=$2
+    _zs_o=
+    _zs_first=1
+    [ -n "$_zs_v" ] || return 0
+    while :; do
+        case $_zs_v in
+            *:*) _zs_c=${_zs_v%%:*}; _zs_v=${_zs_v#*:}; _zs_last= ;;
+            *) _zs_c=$_zs_v; _zs_v=; _zs_last=1 ;;
+        esac
+        _zs_n=$_zs_c
+        while :; do
+            case $_zs_n in
+                /) break ;;
+                */) _zs_n=${_zs_n%/} ;;
+                *) break ;;
+            esac
+        done
+        if [ -z "$_zs_c" ] || [ "$_zs_n" != "$_zs_d" ]; then
+            if [ -n "$_zs_first" ]; then _zs_o=$_zs_c; _zs_first=
+            else _zs_o=$_zs_o:$_zs_c; fi
+        fi
+        [ -z "$_zs_last" ] || break
+    done
+    printf '%s' "$_zs_o"
+}
+EOF
+}
+
+# The restore body, generated once and emitted twice: inline as
+# _zenv_deactivate() when activating, and standalone by `zenv shell deactivate`
+# for a shell that lost the function. Both strip the same directories.
+#
+# _erpfx is the newline-separated prefix list; _erind is the indent.
+_emit_restore_body() {
+    _erpfx=$1
+    _erind=${2:-}
+
+    for _erv in PATH PYTHONPATH MANPATH; do
+        case $_erv in
+            PATH) _ersub=bin ;;
+            PYTHONPATH) _ersub=lib/zeek/python ;;
+            MANPATH) _ersub=share/man ;;
+        esac
+        _erdirs=$(_strip_dirs "$_erpfx" "$_ersub")
+        if [ -n "$_erdirs" ]; then
+            printf '%sfor _zd in%s; do\n' "$_erind" "$(_emit_words "$_erdirs")"
+            printf '%s    %s=$(_zenv_strip "${%s-}" "$_zd")\n' "$_erind" "$_erv" "$_erv"
+            printf '%sdone\n' "$_erind"
+            printf '%sunset _zd\n' "$_erind"
+            # Anything the user added survives, and is kept in place. But if only
+            # empty components are left there is nothing of theirs to preserve,
+            # and the exact original goes back -- which is how an unset variable
+            # returns to unset rather than to empty, and how ':' (meaning "the
+            # current directory") is not quietly collapsed to ''.
+            printf '%scase ${%s-} in\n' "$_erind" "$_erv"
+            printf '%s    *[!:]*)\n' "$_erind"
+            _emit_assign "$_erv" "\${$_erv-}" "$_erind        "
+            printf '%s        ;;\n' "$_erind"
+            printf '%s    *)\n' "$_erind"
+            printf '%s        if [ "${_ZENV_HAD_%s-}" = 0 ]; then unset %s\n' \
+                "$_erind" "$_erv" "$_erv"
+            printf '%s        else\n' "$_erind"
+            _emit_assign "$_erv" "\${_ZENV_OLD_$_erv-}" "$_erind            "
+            printf '%s        fi\n' "$_erind"
+            printf '%s        ;;\n' "$_erind"
+            printf '%sesac\n' "$_erind"
+        fi
+        printf '%sunset _ZENV_HAD_%s _ZENV_OLD_%s _ZENV_EXP_%s\n' \
+            "$_erind" "$_erv" "$_erv" "$_erv"
+    done
+
+    for _erv in ZEEKPATH ZEEK_PLUGIN_PATH ZKG_CONFIG_FILE ZEEK_ZKG_CONFIG_DIR ZEEK_ZKG_STATE_DIR; do
+        printf '%sif [ "${_ZENV_HAD_%s-}" = 1 ]; then\n' "$_erind" "$_erv"
+        _emit_assign "$_erv" "\${_ZENV_OLD_$_erv-}" "$_erind    "
+        printf '%selif [ "${_ZENV_HAD_%s-}" = 0 ]; then\n' "$_erind" "$_erv"
+        printf '%s    unset %s\n' "$_erind" "$_erv"
+        printf '%sfi\n' "$_erind"
+        printf '%sunset _ZENV_HAD_%s _ZENV_OLD_%s _ZENV_EXP_%s\n' \
+            "$_erind" "$_erv" "$_erv" "$_erv"
+    done
+
+    # PS1 is never exported: doing so would change every child's environment,
+    # which is a difference `deactivate` could not undo.
+    printf '%sif [ "${_ZENV_HAD_PS1-}" = 1 ]; then\n' "$_erind"
+    printf '%s    PS1=$_ZENV_OLD_PS1\n' "$_erind"
+    printf '%selif [ "${_ZENV_HAD_PS1-}" = 0 ]; then\n' "$_erind"
+    printf '%s    unset PS1\n' "$_erind"
+    printf '%sfi\n' "$_erind"
+    printf '%sunset _ZENV_HAD_PS1 _ZENV_OLD_PS1 _ZENV_EXP_PS1\n' "$_erind"
+
+    printf '%sunset ZENV ZENV_PREFIX ZENV_ZKG_DIR\n' "$_erind"
+}
+
+cmd_shell_activate() {
+    _name=
+    _noauto=
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --no-autoconfig) _noauto=1 ;;
+            -*) _die "shell activate: unknown option '$1'" ;;
+            *)
+                [ -z "$_name" ] \
+                    || _die "shell activate: only one name, got '$_name' and '$1'"
+                _name=$1
+                ;;
+        esac
+        shift
+    done
+    _require_env "$_name"
+
+    _prefix=$(_env_get "$_name" prefix)
+    _prefix=$(_realpath "$_prefix") \
+        || _die "cannot resolve the prefix of '$_name'"
+    _zkgdir=$(_env_get "$_name" zkg_dir)
+    _zkgdir=$(_realpath "$_zkgdir") \
+        || _die "cannot resolve the zkg directory of '$_name'"
+
+    # An environment with nothing installed yet still activates: the layout is
+    # known, so the search paths are computed from it rather than refused.
+    _zc=$_prefix/bin/zeek-config
+    _zp=
+    _pd=
+    if [ -x "$_zc" ]; then
+        _zp=$("$_zc" --zeekpath 2>/dev/null) || _zp=
+        _pd=$("$_zc" --plugin_dir 2>/dev/null) || _pd=
+    fi
+    if [ -z "$_zp" ]; then
+        _zp=.:$_prefix/share/zeek:$_prefix/share/zeek/policy
+        _zp=$_zp:$_prefix/share/zeek/site:$_prefix/share/zeek/builtin-plugins
+    fi
+    [ -n "$_pd" ] || _pd=$_prefix/lib/zeek/plugins
+
+    # With no config in the zkg dir, zkg does not fail loudly: it falls through
+    # to its in-memory defaults, which are self-contained inside the state dir
+    # and so land somewhere harmless but *not* on this install's site and plugin
+    # directories. Wiring it now is what makes the env's zkg the env's own. It
+    # runs only when there is an install to wire to -- an env with nothing built
+    # yet still activates -- and everything it prints goes to stderr.
+    #
+    # A subshell, so a refusal -- no zkg on this machine, or the finding-6 gate --
+    # warns instead of aborting the activation. Landing on zkg's in-memory
+    # defaults is an acceptable spot: they are self-contained inside the state
+    # dir and name no install prefix, so they cannot trigger the relocation the
+    # gate exists to prevent. Its stdout is redirected too, so nothing it or the
+    # zkg it runs might print can reach the code this command emits.
+    if [ -z "$_noauto" ] && [ -x "$_zc" ] && [ ! -f "$_zkgdir/config" ]; then
+        if ! (_autoconfig "$_name") >&2; then
+            _warn "could not wire zkg for '$_name' automatically (see above)"
+            _say "  activating anyway; run 'zenv autoconfig $_name' once that is fixed"
+        fi
+    fi
+
+    # zkg's own view, when it has been wired up: its script_dir and plugin_dir
+    # join the search paths so a package installed through zkg is found.
+    _zkgscript=$(_ini_get "$_zkgdir/config" script_dir 2>/dev/null || true)
+    _zkgplugin=$(_ini_get "$_zkgdir/config" plugin_dir 2>/dev/null || true)
+
+    _zeekpath=$(_join_uniq "$(_colon_to_lines "$_zp")$NL$_zkgscript")
+    _pluginpath=$(_join_uniq "$(_colon_to_lines "$_pd")$NL$_zkgplugin")
+
+    _prefixes=$(_all_prefixes)
+    # shellcheck disable=SC2031
+    #   This is the caller's PATH, which is the whole point: the surgery has to
+    #   run where the real value is visible. The only other place that assigns
+    #   PATH is cmd_autoconfig's subshell, which has already exited by the time
+    #   activation gets here -- and never affected this process anyway.
+    _newpath=$(_path_strip "${PATH:-}" "$(_strip_dirs "$_prefixes" bin)")
+    if [ -z "$_newpath" ]; then
+        _newpath=$_prefix/bin
+    else
+        _newpath=$_prefix/bin:$_newpath
+    fi
+    _newpy=$(_path_strip "${PYTHONPATH:-}" "$(_strip_dirs "$_prefixes" lib/zeek/python)")
+    if [ -z "$_newpy" ]; then
+        _newpy=$_prefix/lib/zeek/python
+    else
+        _newpy=$_prefix/lib/zeek/python:$_newpy
+    fi
+    _newman=$(_path_strip "${MANPATH:-}" "$(_strip_dirs "$_prefixes" share/man)")
+    if _all_empty "$_newman"; then
+        # No man path of substance: unset, empty, or nothing but separators. All
+        # three mean "the system default" to man, and a bare value would replace
+        # that default, so the trailing empty component keeps it. Testing the
+        # *stripped* value rather than the original is what makes re-activating
+        # an already-active environment a no-op.
+        _newman=$_prefix/share/man:
+    else
+        _newman=$_prefix/share/man:$_newman
+    fi
+
+    # Switching environments is the moment the shared-source-tree reminder
+    # matters: the tree is still checked out wherever the last environment left
+    # it, and a package built now would compile against those sources. Stderr
+    # only, like everything else here, so it cannot reach the emitted code.
+    # shellcheck disable=SC2031
+    #   cmd_status assigns this inside a command substitution, which ended long
+    #   before any activation reaches here. This reads the caller's value, on
+    #   purpose -- the same arrangement ZENV_DISABLE_PROMPT already uses.
+    if [ -z "${ZENV_DISABLE_REMINDER:-}" ]; then
+        _dist_reminder "$_name" "$_prefix"
+        [ -n "$_REMIND" ] && _warn "$_REMIND"
+    fi
+
+    # --- stdout from here on is shell code and nothing else ---
+
+    printf '# zenv activate %s\n' "$_name"
+    _emit_strip_fn
+
+    for _v in PATH PYTHONPATH MANPATH ZEEKPATH ZEEK_PLUGIN_PATH ZKG_CONFIG_FILE ZEEK_ZKG_CONFIG_DIR ZEEK_ZKG_STATE_DIR; do
+        _emit_save "$_v"
+    done
+
+    _emit_export PATH "$_newpath"
+    _emit_export PYTHONPATH "$_newpy"
+    _emit_export MANPATH "$_newman"
+    _emit_export ZENV "$_name"
+    _emit_export ZENV_PREFIX "$_prefix"
+    _emit_export ZENV_ZKG_DIR "$_zkgdir"
+    _emit_export ZEEKPATH "$_zeekpath"
+    _emit_export ZEEK_PLUGIN_PATH "$_pluginpath"
+    _emit_export ZKG_CONFIG_FILE "$_zkgdir/config"
+    _emit_export ZEEK_ZKG_CONFIG_DIR "$_zkgdir"
+    _emit_export ZEEK_ZKG_STATE_DIR "$_zkgdir"
+
+    # ZENV_DISABLE_PROMPT is checked in the shell, not here, so an unexported
+    # value still works. With it set, PS1 is neither saved nor touched.
+    printf 'if [ -z "${ZENV_DISABLE_PROMPT-}" ]; then\n'
+    _emit_save PS1 '    '
+    printf '    PS1=%s"${_ZENV_OLD_PS1-}"\n' "$(_shq "(zenv:$_name) ")"
+    printf 'fi\n'
+
+    # The prefix list is captured now, so deactivating still works after the
+    # environment has been removed. It always includes this one.
+    _prefixes=$(_uniq_lines "$_prefixes$NL$_prefix")
+    printf '_zenv_deactivate() {\n'
+    _emit_restore_body "$_prefixes" '    '
+    printf '    unset -f _zenv_deactivate _zenv_strip\n'
+    printf '}\n'
+}
+
+cmd_shell_deactivate() {
+    [ $# -eq 0 ] || _die "shell deactivate: unexpected argument '$1'"
+
+    _prefixes=$(_all_prefixes)
+    if [ -z "$_prefixes" ] && [ -z "${ZENV:-}" ]; then
+        # Nothing to undo. Emit nothing rather than code that would define and
+        # immediately unset a helper for no reason.
+        printf '# zenv: nothing active\n'
+        return 0
+    fi
+
+    printf '# zenv deactivate (fallback: this shell has no _zenv_deactivate)\n'
+    _emit_strip_fn
+    _emit_restore_body "$_prefixes"
+    printf 'unset -f _zenv_strip\n'
+    printf 'if command -v _zenv_deactivate >/dev/null 2>&1; then\n'
+    printf '    unset -f _zenv_deactivate\n'
+    printf 'fi\n'
+}
+
+cmd_shell() {
+    _sub=${1:-}
+    [ $# -gt 0 ] && shift
+    case $_sub in
+        activate) cmd_shell_activate "$@" ;;
+        deactivate) cmd_shell_deactivate "$@" ;;
+        '') _die "shell: expected 'activate <name>' or 'deactivate'" ;;
+        *) _die "shell: unknown subcommand '$_sub'" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# One command in an environment, without activating
+#
+# `zenv exec <name> [--] <cmd>…` evaluates the very code `zenv shell activate`
+# emits and then execs the command, so the environment a one-off command sees
+# and the environment an activated shell sees can never drift apart. The eval
+# happens in this process, which is replaced by the command, so nothing of it
+# survives -- and `exec` means the command's exit status is this command's, and
+# signals reach it directly rather than through a wrapper.
+# ---------------------------------------------------------------------------
+
+cmd_exec() {
+    _noauto=
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --no-autoconfig) _noauto=1 ;;
+            --)
+                shift
+                break
+                ;;
+            -*) _die "exec: unknown option '$1'" ;;
+            *) break ;;
+        esac
+        shift
+    done
+
+    [ $# -gt 0 ] || _die "exec: expected an environment name
+      usage: zenv exec <name> [--] <command> [argument…]"
+    _xname=$1
+    shift
+    # A `--` between the name and the command is optional and consumed, so a
+    # command with its own flags needs no thought: both `zenv exec a -- zeek -N`
+    # and `zenv exec a zeek -N` work, and only zenv's own options are parsed.
+    if [ "${1:-}" = "--" ]; then
+        shift
+    fi
+    [ $# -gt 0 ] || _die "exec: expected a command to run
+      usage: zenv exec $_xname [--] <command> [argument…]"
+    _require_env "$_xname"
+
+    if [ -n "$_noauto" ]; then
+        _xcode=$(cmd_shell_activate --no-autoconfig "$_xname") || exit 1
+    else
+        _xcode=$(cmd_shell_activate "$_xname") || exit 1
+    fi
+
+    # Not exported: it suppresses the PS1 rewrite in the emitted code, which is
+    # pointless for a command that is not a shell, without the child seeing a
+    # variable zenv invented.
+    ZENV_DISABLE_PROMPT=1
+    eval "$_xcode"
+    exec "$@"
+}
+
+cmd_init() {
+    _what=${1:-sh}
+    case $_what in
+        sh | bash | zsh | posix) : ;;
+        fish)
+            _die "zenv init fish is not supported yet: the emitted code is POSIX
+      shell, which fish cannot eval. Use 'zenv exec <name> -- <cmd>' from fish,
+      or run a POSIX shell for activation"
+            ;;
+        -*) _die "init: unknown option '$_what'" ;;
+        *) _die "init: unknown shell '$_what' (try sh, bash or zsh)" ;;
+    esac
+
+    # One function for all three: bash and zsh both run POSIX shell functions,
+    # so there is nothing per-shell to emit and nothing to drift.
+    cat <<'EOF'
+# zenv shell integration. Add to your shell's startup file:
+#     eval "$(zenv init zsh)"
+zenv() {
+    case ${1-} in
+        activate)
+            shift
+            _zenv_out=$(command zenv shell activate "$@") || {
+                unset _zenv_out
+                return 1
+            }
+            eval "$_zenv_out"
+            unset _zenv_out
+            ;;
+        deactivate)
+            if command -v _zenv_deactivate >/dev/null 2>&1; then
+                _zenv_deactivate
+            else
+                _zenv_out=$(command zenv shell deactivate) || {
+                    unset _zenv_out
+                    return 1
+                }
+                eval "$_zenv_out"
+                unset _zenv_out
+            fi
+            ;;
+        *) command zenv "$@" ;;
+    esac
+}
+EOF
+}
+
+# Reached only when the shell function is not installed: a child process cannot
+# change its parent's environment, so say how to make it work rather than
+# pretending to succeed.
+cmd_activate_hint() {
+    _warn "'zenv $1' cannot work as a subprocess: it has to run in your shell"
+    _say "  set it up once:  eval \"\$(zenv init zsh)\"   (add to ~/.zprofile)"
+    # Offer the env's own stub only when it is really there. A hint naming a file
+    # that does not exist is worse than the eval form, which always works.
+    _hintstub=
+    if [ "$1" = activate ] && [ -n "${2:-}" ] && _valid_name "$2"; then
+        _zenv_root
+        if [ -f "$ZENV_ROOT_RESOLVED/$2/activate" ]; then
+            _hintstub=$ZENV_ROOT_RESOLVED/$2/activate
+        fi
+    fi
+    if [ -n "$_hintstub" ]; then
+        _say "  or, right now:   . $_hintstub"
+    else
+        _say "  or, right now:   eval \"\$(zenv shell $1${2:+ $2})\""
+    fi
+    exit 1
+}
+
+cmd_help() {
+    cat <<EOF
+zenv $ZENV_VERSION -- venv-style environments for Zeek + zkg.
+
+zenv never builds Zeek. It creates the directories, tells you the --prefix to
+install into, wires zkg up afterwards, and sets your shell environment.
+
+Usage: zenv <command> [arguments]
+
+Inspection
+  root [--source]        print the parent directory (and where it came from)
+  list [--names]         list environments
+  prefix [name]          print an environment's install prefix -- your --prefix
+  zkgdir [name]          print an environment's zkg state directory
+  dist [name]            print an environment's source tree, only if it verifies
+  status [name]          everything about one environment, in one screen
+  doctor [name]          diagnose problems (no name: every environment)
+                         exits 0 clean, 1 warnings, 2 errors
+  version                print zenv's version
+
+Creating
+  new <name> [--src DIR]  create an empty environment and print its prefix
+  adopt <name>           register an install that already exists
+                         (--from DIR, --zkg DIR, --move or --link)
+  autoconfig [name]      wire an environment's zkg to the install at its prefix
+                         (--fix-paths to repair a stale manifest.json first)
+
+Using
+  init [sh|bash|zsh]     emit the shell function; eval "\$(zenv init zsh)"
+  activate <name>        use an environment in this shell (needs 'init')
+  deactivate             restore this shell
+  exec <name> -- <cmd>   run one command in an environment without activating
+  shell activate <name>  print the shell code 'activate' evaluates
+  shell deactivate       print the shell code 'deactivate' evaluates
+
+Housekeeping
+  link <name>            point ~/zeek and ~/.zkg at an environment
+  unlink                 remove those two symlinks
+  remove <name>          delete an environment (--keep-zkg, --yes, --force)
+
+Undoing
+  restore <name>         undo 'adopt --move': put the install back where it was
+                         (--dry-run, --yes)
+  uninstall              remove zenv itself, and say what it leaves behind
+                         (--dry-run, --purge, --yes)
+
+Where a [name] is optional it defaults to the active environment (\$ZENV) --
+except 'doctor', which checks every environment when given no name.
+
+Environment variables
+  ZENV_ROOT              override the parent directory for this shell or command
+  ZENV_DISABLE_PROMPT    set to leave PS1 alone on activation
+  ZENV_DISABLE_REMINDER  set to silence the source-tree reminder on activation
+  ZENV_PYTHON            the python used to read and write zkg's manifest.json
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+#
+# Sourcing this file with ZENV_LIB_ONLY=1 set defines every function without
+# dispatching, so the internal helpers can be unit-tested as themselves rather
+# than through a test-only subcommand.
+# ---------------------------------------------------------------------------
+
+if [ -z "${ZENV_LIB_ONLY:-}" ]; then
+    _cmd=${1:-}
+    [ $# -gt 0 ] && shift
+
+    case $_cmd in
+        '' | help | --help | -h) cmd_help ;;
+        version | --version | -V) cmd_version ;;
+        root) cmd_root "$@" ;;
+        list | ls) cmd_list "$@" ;;
+        prefix) cmd_prefix "${1:-}" ;;
+        zkgdir) cmd_zkgdir "${1:-}" ;;
+        new) cmd_new "$@" ;;
+        adopt) cmd_adopt "$@" ;;
+        autoconfig) cmd_autoconfig "$@" ;;
+        dist) cmd_dist "$@" ;;
+        link) cmd_link "$@" ;;
+        unlink) cmd_unlink "$@" ;;
+        remove | rm) cmd_remove "$@" ;;
+        restore) cmd_restore "$@" ;;
+        uninstall) cmd_uninstall "$@" ;;
+        exec) cmd_exec "$@" ;;
+        doctor) cmd_doctor "$@" ;;
+        status) cmd_status "$@" ;;
+        init) cmd_init "${1:-sh}" ;;
+        shell) cmd_shell "$@" ;;
+        activate) cmd_activate_hint activate "${1:-}" ;;
+        deactivate) cmd_activate_hint deactivate ;;
+        *)
+            _warn "unknown command '$_cmd'"
+            _say "run 'zenv help' for the command list"
+            exit 2
+            ;;
+    esac
+fi
