@@ -13,6 +13,7 @@ each command actually does, and what to do when something looks wrong.
 - [Adopting an install that already exists](#adopting-an-install-that-already-exists)
 - [`zenv link`: a system default](#zenv-link-a-system-default)
 - [Source trees and zeek_dist](#source-trees-and-zeek_dist)
+- [Packages that ship an executable](#packages-that-ship-an-executable)
 - [`zenv doctor`](#zenv-doctor)
 - [Uninstalling completely](#uninstalling-completely)
 - [Troubleshooting](#troubleshooting)
@@ -461,6 +462,68 @@ as nothing unusual. The version check is all zenv has there, and all it claims.
 
 If you would rather not think about any of this, the alternative is one checkout per environment:
 `git worktree add ../zeek-dev` costs a directory and removes the shared state entirely.
+
+## Packages that ship an executable
+
+Short version: **an executable a package installs is already per-environment, and needs no PATH
+work from you.** The chain is worth tracing anyway, because the one link zenv has no say in — the
+run path baked into the binary — is the link that fails silently when it is wrong.
+
+A package declares them in its `zkg.meta`:
+
+```
+executables = build/shm-lb/shm_lb
+```
+
+zkg builds the package inside its own clone, under that environment's `state_dir`, and then symlinks
+each declared path from the clone into `bin_dir`
+([zkg's manager](https://github.com/zeek/package-manager/blob/master/zeekpkg/manager.py), in
+`_refresh_bin_dir`). `zenv autoconfig` set `bin_dir` to `<prefix>/bin`, and activation puts that
+directory first on PATH while stripping every other environment's, so the executable arrives and
+leaves with the environment:
+
+```
+$ zenv activate bleeding && command -v shm_lb
+/Users/you/zenv/bleeding/zeek/bin/shm_lb
+$ zenv activate v8.0.9 && command -v shm_lb
+/Users/you/zenv/v8.0.9/zeek/bin/shm_lb
+```
+
+Two builds of one package, one per environment, each from its own clone. Nothing is shared, so
+nothing has to be swapped. A package README that says an executable has no install target and that
+you must fix PATH by hand is describing the build, not the `executables` key.
+
+### The run path is a baked prefix too
+
+An executable that links a shared library out of the prefix records where to find it **at link
+time**, as an absolute path:
+
+```
+$ otool -l bleeding/zeek/bin/shm_lb | grep -A2 LC_RPATH    # readelf -d, on Linux
+         path /Users/you/zenv/bleeding/zeek/lib
+```
+
+That has to be the environment's own real directory, for the same reason
+[an install does](#why-each-environment-needs-its-own-prefix). Recorded through `~/zeek` it does not
+merely go stale, it **floats**: the binary then loads whichever environment `zenv link` names *now*,
+which is a different Zeek's library than the headers it compiled against. Nothing announces that.
+The version guard above catches a mismatched *plugin* at `dlopen`, loudly; a mismatched library
+behind a path that still resolves is a crash much later, or no symptom at all.
+
+The rule that follows is one line: **activate the environment before building anything.** In a shell
+with nothing active, `zeek-config` is found through `~/zeek/bin` and reports the linked environment
+— which is how a floating run path gets made in the first place. `zenv prefix <name>` prints the
+real directory and never the symlink, and `zenv exec <name> --` is enough for a one-off build.
+
+### Why not to carry a build directory between environments
+
+A library lookup is normally cached on first success and never repeated. So a build directory reused
+across a switch can hold a library path belonging to the *previous* environment while every other
+value in it has been updated, and re-running the package's `configure` will not correct it, because
+nothing re-searches. The result builds and installs cleanly and is wrong.
+
+A per-environment zkg clone starts from an empty build directory every time, which is why the
+question never arises on that path. Building by hand, delete the build directory when you switch.
 
 ## `zenv doctor`
 
