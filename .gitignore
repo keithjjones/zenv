@@ -8,3 +8,5 @@
 # Test leftovers, if a run is interrupted before its cleanup.
 /tests/**/tmp.*
 .DS_Store
+
+.claude
