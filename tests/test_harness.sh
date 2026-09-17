@@ -7,6 +7,11 @@
 #   Single-quoted `$` in this file is shell code for another shell to expand,
 #   or the literal text an assertion looks for. Expanding it in this process is
 #   the bug these cases exist to catch.
+#
+# shellcheck disable=SC2119,SC2120
+#   The assert_* helpers take an optional extra message that is normally absent;
+#   "referenced but never passed" is the cost of a label only attached when there
+#   is something extra to say, and shellcheck cannot see it as optional.
 
 . "$REPO_ROOT/tests/lib.sh"
 

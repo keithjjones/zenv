@@ -17,6 +17,11 @@
 #   Single-quoted `$` in this file is shell code for another shell to expand,
 #   or the literal text an assertion looks for. Expanding it in this process is
 #   the bug these cases exist to catch.
+#
+# shellcheck disable=SC2119,SC2120
+#   The assert_* helpers take an optional extra message that is normally absent;
+#   "referenced but never passed" is the cost of a label only attached when there
+#   is something extra to say, and shellcheck cannot see it as optional.
 
 . "$REPO_ROOT/tests/lib.sh"
 
@@ -614,8 +619,12 @@ test_doctor_reports_a_recorded_commit_the_tree_no_longer_has() {
     have_git || return 0
     sha=$(mkwired_git a "$SANDBOX/tree" 9.1.0-dev.7) || return 1
     # A re-clone, or rewritten history: the record survives, the commit does not.
+    # The rewrite is dated a day earlier, or an instant re-init could hash to the
+    # *same* commit object -- identical tree, author and message in the same
+    # second produce an identical sha, which would silently undo the rewrite.
     rm -rf "$SANDBOX/tree/.git"
-    mkgit "$SANDBOX/tree" >/dev/null || return 1
+    GIT_AUTHOR_DATE=2020-01-01T00:00:00Z GIT_COMMITTER_DATE=2020-01-01T00:00:00Z \
+        mkgit "$SANDBOX/tree" >/dev/null || return 1
 
     doctor a
     assert_contains "$REPORT" "a commit $SANDBOX/tree does not have"

@@ -3868,12 +3868,16 @@ _emit_save() {
 
 # Restore a variable to a value, exported or not as it was.
 #
-# Dropping the export attribute takes three tries because no one way covers every
-# shell: `unset` clears it in a POSIX shell, but zsh's tied parameters (MANPATH is
-# one, and zsh gives every shell an unexported empty MANPATH) keep it across an
-# unset and a reassignment, and zsh has no `export -n` while bash 3.2 has no
-# `typeset -g`. Each attempt is allowed to fail; between them they cover sh, bash
-# and zsh, and the final `:` keeps a shell without any of them quiet.
+# Dropping the export attribute: `unset` plus a reassignment clears it in a POSIX
+# shell (dash included) and in bash, but zsh's tied parameters (MANPATH is one,
+# and zsh gives every shell an unexported empty MANPATH) keep it across an unset
+# and a reassignment, and zsh has no `export -n` while bash 3.2 has no
+# `typeset -g`. So the attempts below are run only when the variable is *still*
+# exported after the reassignment -- a recheck that also keeps dash from ever
+# reaching `export -n`, which dash treats as a fatal builtin error that exits the
+# shell before any `||` fallback can run. Covered by tests/test_shell.sh's
+# "unexported variable comes back local" case and the deactivate env-diff case,
+# which run the same emitted code under sh, bash and zsh.
 #
 # _emit_assign <VAR> <shell expression for the value> <indent>
 _emit_assign() {
@@ -3881,8 +3885,18 @@ _emit_assign() {
         "${3:-}" "$1" "$1" "$2" "$1"
     printf '%selse _zenv_v=%s; unset %s; %s=$_zenv_v; unset _zenv_v\n' \
         "${3:-}" "$2" "$1" "$1"
-    printf '%s    export -n %s 2>/dev/null || typeset +x -g %s 2>/dev/null || :\n' \
+    # The unset and reassignment already drop the export attribute in a POSIX
+    # shell and in bash; only a shell where it does not (zsh's tied parameters)
+    # still has the variable exported here. The recheck keeps the attempts from
+    # *reaching* a shell that would die on them: dash has no 'export -n' and
+    # treats it as a fatal builtin error, exiting the whole script, so the
+    # '||' fallbacks below could never run. Guarded behind a predicate that is
+    # safe in every shell, only a shell that actually still needs clearing gets
+    # an attempt that can clear it.
+    printf '%s    if env | grep -q "^%s="; then\n' "${3:-}" "$1"
+    printf '%s        export -n %s 2>/dev/null || typeset +x -g %s 2>/dev/null || :\n' \
         "${3:-}" "$1" "$1"
+    printf '%s    fi\n' "${3:-}"
     printf '%sfi\n' "${3:-}"
 }
 
