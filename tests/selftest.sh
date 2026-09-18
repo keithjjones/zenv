@@ -155,6 +155,11 @@ cat >"$CASES/test_selftest_escape_modify.sh" <<'EOF'
 . "$REPO_ROOT/tests/lib.sh"
 
 test_escapes_by_modifying_a_file() {
+     # guard_init stamps its reference at run start. A clobber in the same clock
+     # tick is not *strictly* newer, so the mtime arm (find -newer) misses it on
+     # a 1s-granularity filesystem -- the race a sub-second selftest run exposes
+     # but a real multi-minute run never does. Wait one tick to restore the gap.
+    sleep 1
     printf 'clobbered\n' >"$REAL_HOME/zeek/share/zeek/site/packages/packages.zeek"
     assert_eq a a
 }
@@ -195,6 +200,10 @@ cat >"$CASES/test_selftest_external_touch.sh" <<'EOF'
 . "$REPO_ROOT/tests/lib.sh"
 
 test_touches_the_real_home_the_way_a_login_shell_does() {
+      # Cross the clock tick first, as test_escapes_by_modifying_a_file: the mtime
+      # arm can only *see* a no-op rewrite whose mtime is strictly past the stamp,
+      # and a same-tick rewrite on a coarse-granularity filesystem is invisible.
+    sleep 1
     printf 'original\n' >"$REAL_HOME/zeek/share/zeek/site/packages/packages.zeek"
     printf 'idx2\n' >"$REAL_HOME/.zkg/clones/source/zeek/.git/index"
     assert_eq a a
