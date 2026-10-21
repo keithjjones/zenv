@@ -350,6 +350,22 @@ linked or active unless `--force`, `--keep-zkg` spares the zkg state, and it req
 `$ZENV_ROOT/<name>` is a real directory and a direct child of the root — never a symlink — so
 removal cannot follow a link out of the root.
 
+## Renaming an environment
+
+`zenv rename <old> <new>` changes an environment's name, for when the first spelling was
+wrong. It moves the directory and rewrites the name and paths in its metadata and activation
+stub, so `zenv prefix <new>` and `zenv activate <new>` work straight away.
+
+It only works while nothing has been built in the environment: no install in its prefix and
+nothing in its zkg directory. An install bakes its prefix into its binaries, and zkg's config
+and autoloader hold absolute paths, so moving either would leave them pointing at a directory
+that no longer exists. Rename also refuses while the environment is linked as the system
+default or active in your shell, when the new name is taken, and when its prefix or zkg
+directory lives outside it, as `adopt --link` makes them.
+
+For an environment that has been built or configured, `zenv remove <name>` and `zenv new <name>`
+start it again.
+
 ## `zenv link`: a system default
 
 ```sh

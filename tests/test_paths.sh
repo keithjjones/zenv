@@ -808,5 +808,53 @@ test_the_activate_stub_is_syntactically_valid_and_names_its_env() {
         "and go through 'command' so the shell function cannot recurse"
 }
 
+test_rename_moves_an_empty_environment_and_its_paths() {
+    zenv new a >/dev/null 2>&1 || return 1
+    assert_status 0 zenv rename a b
+    assert_missing "$ZENV_ROOT/a" "the old directory should be gone"
+    assert_dir "$ZENV_ROOT/b/zeek" "the prefix should have moved with it"
+    t_body=$(cat "$ZENV_ROOT/b/env")
+    assert_contains "$t_body" "name=b" "the metadata should carry the new name"
+    assert_contains "$t_body" "prefix=$ZENV_ROOT/b/zeek" "and the new prefix"
+    assert_contains "$t_body" "zkg_dir=$ZENV_ROOT/b/zkg" "and the new zkg dir"
+    assert_contains "$(cat "$ZENV_ROOT/b/activate")" "'b'" "the activation stub should name b"
+    capture zenv prefix b
+    assert_contains "$OUT" "$ZENV_ROOT/b/zeek" "and zenv should resolve the new name"
+}
+
+test_rename_refuses_an_environment_with_an_install_in_it() {
+    zenv new a >/dev/null 2>&1 || return 1
+    mkprefix "$ZENV_ROOT/a/zeek"
+    assert_status 1 zenv rename a b
+    assert_contains "$OUT" "built or configured" "it should say why"
+    assert_dir "$ZENV_ROOT/a" "and the environment should not have moved"
+    assert_missing "$ZENV_ROOT/b" "and nothing should exist under the new name"
+}
+
+test_rename_refuses_an_environment_whose_zkg_is_configured() {
+    zenv new a >/dev/null 2>&1 || return 1
+    printf '[sources]\n' >"$ZENV_ROOT/a/zkg/config"
+    assert_status 1 zenv rename a b
+    assert_dir "$ZENV_ROOT/a" "a configured zkg dir should keep the environment in place"
+}
+
+test_rename_refuses_a_taken_name_a_bad_name_an_active_env_and_a_linked_one() {
+    zenv new a >/dev/null 2>&1 || return 1
+    zenv new b >/dev/null 2>&1 || return 1
+    assert_status 1 zenv rename a b
+    assert_contains "$OUT" "already exists" "a taken name should be refused"
+
+    assert_status 1 zenv rename a 'not valid'
+    assert_dir "$ZENV_ROOT/a" "and so should a name that is not valid"
+
+    assert_status 1 env ZENV=a "$ZENV_BIN" rename a c
+    assert_contains "$OUT" "active in this shell" "an active environment should be refused"
+
+    assert_status 0 zenv link a
+    assert_status 1 zenv rename a c
+    assert_contains "$OUT" "system default" "and a linked one should be refused"
+    assert_dir "$ZENV_ROOT/a" "every refusal should leave the environment where it was"
+}
+
 run_cases
 

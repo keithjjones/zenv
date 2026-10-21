@@ -113,6 +113,7 @@ as it was, including leaving variables unset that started unset.
 | `link <name>` | point ~/zeek and ~/.zkg at an environment |
 | `unlink` | remove those two symlinks |
 | `remove <name>` | delete an environment (--keep-zkg, --yes, --force) |
+| `rename <old> <new>` | rename an environment nothing has been built in |
 | `restore <name>` | undo 'adopt --move': put the install back where it was |
 | `uninstall` | remove zenv itself, and say what it leaves behind |
 

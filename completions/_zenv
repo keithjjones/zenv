@@ -44,6 +44,7 @@ _zenv() {
         'link:point ~/zeek and ~/.zkg at an environment'
         'unlink:remove those two symlinks'
         'remove:delete an environment'
+        'rename:rename an environment nothing has been built in'
         'restore:undo adopt --move, putting the install back'
         'uninstall:remove zenv itself, and say what it leaves behind'
         'help:the command list'
@@ -83,6 +84,9 @@ _zenv() {
                         '--yes[do not ask]' \
                         '--force[remove even when linked or active]' \
                         '*:environment:_zenv_envs'
+                    ;;
+                rename)
+                    _arguments '1:environment:_zenv_envs' '2:new name:'
                     ;;
                 restore)
                     _arguments \

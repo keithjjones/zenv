@@ -2414,6 +2414,97 @@ _restore_apply() {
     return 0
 }
 
+# Copy an environment's metadata, changing only the three keys that hold its name or
+# a path under it. Every other line is kept as it was.
+_rename_env_file() {
+    while IFS= read -r _rnl || [ -n "$_rnl" ]; do
+        case $_rnl in
+            name=*) printf 'name=%s\n' "$3" ;;
+            prefix=*) printf 'prefix=%s\n' "$4" ;;
+            zkg_dir=*) printf 'zkg_dir=%s\n' "$5" ;;
+            *) printf '%s\n' "$_rnl" ;;
+        esac
+    done <"$1" >"$2"
+}
+
+# `zenv rename <old> <new>`. Only an environment with nothing in it can be renamed.
+# An install bakes its prefix into its binaries, and zkg's config and autoloader hold
+# absolute paths, so moving either would leave them pointing at nothing. For those,
+# `remove` and `new` is the way.
+cmd_rename() {
+    _rnold=
+    _rnnew=
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -*) _die "rename: unknown option '$1'" ;;
+            *)
+                if [ -z "$_rnold" ]; then
+                    _rnold=$1
+                elif [ -z "$_rnnew" ]; then
+                    _rnnew=$1
+                else
+                    _die "rename: takes two names, got an extra '$1'"
+                fi
+                ;;
+        esac
+        shift
+    done
+    [ -n "$_rnnew" ] || _die "rename: usage: zenv rename <old> <new>"
+
+    _require_env "$_rnold"
+    _check_name "$_rnnew"
+    [ "$_rnold" != "$_rnnew" ] || _die "rename: '$_rnold' is already called that"
+    _zenv_root
+    _rnreal=$(_env_real_dir "$_rnold") || exit 1
+    _rndest=$ZENV_ROOT_RESOLVED/$_rnnew
+    if [ -e "$_rndest" ] || [ -L "$_rndest" ]; then
+        _die "cannot rename to '$_rnnew': $_rndest already exists"
+    fi
+    if [ "${ZENV:-}" = "$_rnold" ]; then
+        _die "'$_rnold' is active in this shell
+      run 'zenv deactivate' first"
+    fi
+
+    for _rnk in zeek zkg; do
+        _rnp=$(_link_path "$_rnk")
+        _link_state "$_rnp"
+        [ "$_LINK_STATE" = symlink ] || continue
+        _rnd=$(_resolve_soft "$(_link_dest "$_rnp" "$_LINK_TARGET")")
+        if [ "$_rnd" = "$_rnreal" ] || _under "$_rnd" "$_rnreal"; then
+            _die "'$_rnold' is the system default: $_rnp
+      run 'zenv unlink' first"
+        fi
+    done
+
+    # The prefix and zkg dir must be the environment's own. adopt --link keeps them
+    # elsewhere, and renaming would leave the environment pointing at its old name.
+    if [ "$(_resolve_soft "$(_env_get "$_rnold" prefix)")" != "$_rnreal/zeek" ] \
+        || [ "$(_resolve_soft "$(_env_get "$_rnold" zkg_dir)")" != "$_rnreal/zkg" ]; then
+        _die "'$_rnold' keeps its install or zkg state outside its own directory,
+      so it cannot be renamed"
+    fi
+    for _rnsub in zeek zkg; do
+        if [ -n "$(ls -A "$_rnreal/$_rnsub" 2>/dev/null)" ]; then
+            _die "'$_rnold' has something built or configured in $_rnsub/
+      rename only moves an environment with nothing in it yet; 'zenv remove' it
+      and 'zenv new' it again instead"
+        fi
+    done
+
+    # The name is written into the metadata in three places. The new file is built
+    # first, so a failure before the move leaves the environment as it was.
+    _rename_env_file "$_rnreal/env" "$_rnreal/env.rename" "$_rnnew" \
+        "$_rndest/zeek" "$_rndest/zkg" \
+        || { rm -f "$_rnreal/env.rename"; _die "cannot write the new metadata"; }
+    mv "$_rnreal" "$_rndest" \
+        || { rm -f "$_rnreal/env.rename"; _die "cannot move $_rnreal to $_rndest"; }
+    mv "$_rndest/env.rename" "$_rndest/env" \
+        || _die "moved to $_rndest, but could not write its metadata"
+    _write_activate_stub "$_rnnew" "$_rndest/activate"
+    _say "renamed $_rnold to $_rnnew"
+    _say "  prefix  $_rndest/zeek"
+}
+
 cmd_restore() {
     _name=
     _yes=
@@ -4385,6 +4476,7 @@ Housekeeping
   link <name>            point ~/zeek and ~/.zkg at an environment
   unlink                 remove those two symlinks
   remove <name>          delete an environment (--keep-zkg, --yes, --force)
+  rename <old> <new>     rename an environment nothing has been built in
 
 Undoing
   restore <name>         undo 'adopt --move': put the install back where it was
@@ -4429,6 +4521,7 @@ if [ -z "${ZENV_LIB_ONLY:-}" ]; then
         link) cmd_link "$@" ;;
         unlink) cmd_unlink "$@" ;;
         remove | rm) cmd_remove "$@" ;;
+        rename) cmd_rename "$@" ;;
         restore) cmd_restore "$@" ;;
         uninstall) cmd_uninstall "$@" ;;
         exec) cmd_exec "$@" ;;

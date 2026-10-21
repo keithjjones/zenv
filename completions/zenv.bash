@@ -30,7 +30,7 @@ _zenv() {
             root list ls prefix zkgdir dist status doctor version
             new adopt autoconfig
             init activate deactivate exec shell
-            link unlink remove rm
+            link unlink remove rm rename
             restore uninstall help
         ' -- "$cur"))
         return
@@ -56,6 +56,7 @@ _zenv() {
         new) opts='--src' ;;
         adopt) opts='--from --zkg --move --link' ;;
         remove | rm) opts='--keep-zkg --yes --force' ;;
+        rename) ;;
         restore) opts='--dry-run --yes' ;;
         uninstall)
             names=
