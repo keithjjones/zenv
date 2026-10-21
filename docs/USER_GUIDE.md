@@ -605,6 +605,10 @@ The copy in `~/.local/bin` is made at install time and does not follow the check
   block is replaced in place, and every line outside it is left as it was. The block is never
   added twice, and the `<rcfile>.zenv-pre-install` backup from your first install is not
   overwritten.
+- moves a zsh block out of `~/.zprofile` and into `~/.zshrc`. zsh reads `~/.zprofile` only for
+  login shells, so a block left there never reached an interactive zsh that was not a login
+  shell. Only zenv's own lines move; a block you have edited stays where it is. A `~/.zprofile`
+  that zenv created, and that is now empty, is removed.
 - never writes under `$ZENV_ROOT`, so your environments are not touched. They are not rewritten
   either, and an environment made by an older zenv keeps working.
 

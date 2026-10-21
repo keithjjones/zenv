@@ -645,6 +645,120 @@ test_zsh_puts_the_block_in_zshrc_even_when_zprofile_exists() {
         "uninstall should find the block in .zshrc and leave no trace"
 }
 
+# The zsh block as install.sh writes it today, markers and comment included.
+zsh_block() {
+    printf '%s\n' '# >>> zenv >>>' \
+        "# Added by zenv's install.sh. 'zenv uninstall' removes this block exactly." \
+        'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH" ;; esac' \
+        'eval "$(zenv init zsh)"' '# <<< zenv <<<'
+}
+
+test_a_zsh_block_in_zprofile_moves_to_zshrc() {
+    premachine
+    SHELL=/bin/zsh
+    export SHELL
+    T_RC=$HOME/.zshrc
+    # Where an earlier install put it: in an existing .zprofile, beside a line of your own.
+    printf '%s\n' 'export FROM_ZPROFILE=1' >"$HOME/.zprofile"
+    zsh_block >>"$HOME/.zprofile"
+
+    run_install
+    assert_eq 'export FROM_ZPROFILE=1' "$(cat "$HOME/.zprofile")" \
+        "the block should leave .zprofile, and your line should stay"
+    assert_contains "$(cat "$T_RC")" 'eval "$(zenv init zsh)"' "the block should now be in .zshrc"
+    assert_contains "$OUT" 'took the zenv block out of' "and install.sh should say so"
+
+    assert_status 0 "$T_BIN" uninstall --yes
+    assert_missing "$T_RC" "uninstall should find the block in .zshrc and remove the file zenv made"
+    assert_eq 'export FROM_ZPROFILE=1' "$(cat "$HOME/.zprofile")" "and leave your line in .zprofile"
+}
+
+test_a_zsh_block_in_zprofile_is_dropped_when_zshrc_already_has_one() {
+    premachine
+    SHELL=/bin/zsh
+    export SHELL
+    T_RC=$HOME/.zshrc
+    # Both files hold a block, the way a user who edited .zshrc by hand might end up.
+    printf '%s\n' '# >>> zenv >>>' 'eval "$(zenv init zsh)"' '# <<< zenv <<<' >"$HOME/.zprofile"
+    printf '%s\n' '# >>> zenv >>>' 'eval "$(zenv init zsh)"' '# <<< zenv <<<' >"$T_RC"
+
+    run_install
+    assert_missing "$HOME/.zprofile" "a .zprofile that zenv made, left empty, should go"
+    assert_eq 1 "$(grep -cxF '# >>> zenv >>>' "$T_RC")" "and .zshrc should keep one block"
+    assert_contains "$(cat "$T_RC")" 'case ":$PATH:"' "refreshed to this version's"
+    assert_contains "$OUT" 'took the duplicate zenv block out of' "and install.sh should say so"
+}
+
+test_an_edited_zprofile_block_is_left_alone_and_not_copied() {
+    premachine
+    SHELL=/bin/zsh
+    export SHELL
+    T_RC=$HOME/.zshrc
+    printf '%s\n' '# >>> zenv >>>' 'export MY_OWN=1' 'eval "$(zenv init zsh)"' '# <<< zenv <<<' \
+        >"$HOME/.zprofile"
+    t_before=$(cat "$HOME/.zprofile")
+
+    run_install
+    assert_eq "$t_before" "$(cat "$HOME/.zprofile")" \
+        "a block with lines zenv did not write should not move"
+    assert_missing "$T_RC" "and nothing should be added to .zshrc beside it"
+    assert_contains "$OUT" 'left as it is' "and install.sh should say so"
+}
+
+test_a_zprofile_block_is_left_alone_when_zshrc_has_an_edited_one() {
+    premachine
+    SHELL=/bin/zsh
+    export SHELL
+    T_RC=$HOME/.zshrc
+    zsh_block >"$HOME/.zprofile"
+    printf '%s\n' '# >>> zenv >>>' 'export MY_OWN=1' 'eval "$(zenv init zsh)"' '# <<< zenv <<<' >"$T_RC"
+    t_zprofile=$(cat "$HOME/.zprofile")
+    t_zshrc=$(cat "$T_RC")
+
+    run_install
+    assert_eq "$t_zprofile" "$(cat "$HOME/.zprofile")" "neither block should move while one is edited"
+    assert_eq "$t_zshrc" "$(cat "$T_RC")" "and the edited .zshrc block should not change"
+    assert_contains "$OUT" 'left as it is' "and install.sh should say so"
+}
+
+test_a_dry_run_says_the_zprofile_block_would_move_and_changes_nothing() {
+    premachine
+    SHELL=/bin/zsh
+    export SHELL
+    T_RC=$HOME/.zshrc
+    zsh_block >"$HOME/.zprofile"
+    t_snap=$(snap_home)
+
+    run_install --dry-run
+    assert_eq "$t_snap" "$(snap_home)" "a dry run should change nothing"
+    assert_contains "$OUT" 'would move the zenv block' "and should say what it would do"
+}
+
+test_a_bash_install_does_not_move_a_zprofile_block() {
+    premachine
+    SHELL=/bin/bash
+    export SHELL
+    zsh_block >"$HOME/.zprofile"
+    t_before=$(cat "$HOME/.zprofile")
+
+    run_install
+    assert_eq "$t_before" "$(cat "$HOME/.zprofile")" "a bash install should leave .zprofile alone"
+    assert_missing "$HOME/.zshrc" "and should not create a .zshrc"
+}
+
+test_a_zprofile_that_existed_before_zenv_stays_even_when_empty() {
+    premachine
+    SHELL=/bin/zsh
+    export SHELL
+    # An empty .zprofile was there first, so install.sh backed it up before adding the block.
+    : >"$HOME/.zprofile.zenv-pre-install"
+    zsh_block >"$HOME/.zprofile"
+
+    run_install
+    assert_file "$HOME/.zprofile" "a .zprofile that existed before zenv should not be removed"
+    assert_eq '' "$(cat "$HOME/.zprofile")" "and should be left empty"
+}
+
 test_uninstall_without_a_tty_refuses_rather_than_guessing() {
     premachine
     run_install

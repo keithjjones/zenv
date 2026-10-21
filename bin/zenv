@@ -18,7 +18,7 @@
 
 set -u
 
-ZENV_VERSION=0.1.3
+ZENV_VERSION=0.1.4
 
 # The layout of an environment's metadata file. Written into every new environment.
 # A zenv refuses an environment whose format is newer than this one rather than

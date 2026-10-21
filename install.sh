@@ -278,6 +278,61 @@ rc_refresh() {
     [ "$_rrs" -eq 0 ] || die "cannot update the zenv block in $1"
 }
 
+# Whether the block in $1 is one zenv wrote: both markers, and nothing in it zenv did not
+# write. Only such a block is moved or rewritten; anything else is left for you to look at.
+rc_block_is_zenvs() {
+    has_block "$1" && grep -qxF "$RC_END" "$1" || return 1
+    rc_block_in "$1" | sed '1d;$d' | rc_body_is_zenvs
+}
+
+# Take the block out of $1, keeping every other byte. Written through cat rather than
+# mv, so an rc file that is a symlink stays a symlink.
+rc_remove_block() {
+    _rmt=$(mktemp) || die "cannot make a temporary file"
+    awk -v b="$RC_BEGIN" -v e="$RC_END" '
+        $0 == b && !seen { seen = 1; skip = 1; next }
+        skip { if ($0 == e) skip = 0; next }
+        { print }
+    ' "$1" >"$_rmt" && cat "$_rmt" >"$1"
+    _rms=$?
+    rm -f "$_rmt"
+    [ "$_rms" -eq 0 ] || die "cannot remove the zenv block from $1"
+}
+
+# Whether a zenv block in ~/.zprofile should move to ~/.zshrc. Not when ~/.zshrc holds a
+# block zenv did not write: then neither file is touched, and rc_update says why.
+zprofile_block_moves() {
+    [ -z "$RC" ] && [ "$(pick_rc)" = "$HOME/.zshrc" ] || return 1
+    rc_block_is_zenvs "$HOME/.zprofile" || return 1
+    ! has_block "$HOME/.zshrc" || rc_block_is_zenvs "$HOME/.zshrc"
+}
+
+# zsh reads ~/.zprofile only for login shells, and the zenv function the block defines is
+# for interactive ones, so a zsh block belongs in ~/.zshrc. Earlier installs put it in
+# ~/.zprofile whenever that file existed. The block goes into ~/.zshrc first, so a failure
+# part way leaves it in at least one file, and then it comes out of ~/.zprofile.
+move_zsh_block() {
+    _mzp=$HOME/.zprofile
+    if [ -n "$DRY" ]; then
+        say "  would move the zenv block from $_mzp to $HOME/.zshrc"
+        return 0
+    fi
+    if has_block "$HOME/.zshrc"; then
+        rc_update "$HOME/.zshrc" zsh
+        rc_remove_block "$_mzp"
+        say "  took the duplicate zenv block out of $_mzp"
+    else
+        add_block "$HOME/.zshrc" zsh
+        rc_remove_block "$_mzp"
+        say "  took the zenv block out of $_mzp, which zsh reads only at login"
+    fi
+    # A ~/.zprofile with no backup is one zenv created. Once the block has left it empty,
+    # it goes. A file that was there first has a backup, and stays, empty.
+    if [ ! -s "$_mzp" ] && [ ! -f "$_mzp.zenv-pre-install" ]; then
+        rm -f "$_mzp"
+    fi
+}
+
 # Bring the block already in $1 up to date with the one this install.sh writes for
 # shell $2. A block holding lines zenv did not write is left as it is, and says so.
 rc_update() {
@@ -288,8 +343,7 @@ rc_update() {
         say "  (nothing is added twice: the environment must not be applied twice)"
         return 0
     fi
-    _rcu_body=$(printf '%s\n' "$_rcu_have" | sed '1d;$d')
-    if ! grep -qxF "$RC_END" "$1" || ! printf '%s\n' "$_rcu_body" | rc_body_is_zenvs; then
+    if ! rc_block_is_zenvs "$1"; then
         say "  the zenv block in $1 differs from this version's, and zenv cannot match all of it"
         say "  to its own lines -- left as it is. Delete it and rerun install.sh to replace it"
         return 0
@@ -400,7 +454,10 @@ else
 $rcs
 EOF
 
-    if [ -n "$RC_HAS" ]; then
+    if zprofile_block_moves; then
+        say ""
+        move_zsh_block
+    elif [ -n "$RC_HAS" ]; then
         say ""
         rc_update "$RC_HAS" "$(init_shell_for "$RC_HAS")"
     else

@@ -139,7 +139,7 @@ from it:
 ./install.sh
 ```
 
-Your environments are not touched. The rc block is updated if this version writes a different one. The copy in
+Your environments are not touched. The rc block is updated if this version writes a different one, and a zsh block still in `~/.zprofile` moves to `~/.zshrc`. The copy in
 `~/.local/bin` does not follow the checkout, so until you rerun the installer, `zenv` is still
 the old version. Open a new shell, then confirm:
 
