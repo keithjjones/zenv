@@ -121,6 +121,28 @@ test_new_writes_readable_metadata() {
     assert_contains "$body" "created="
 }
 
+test_new_records_the_metadata_format() {
+    zenv new a >/dev/null 2>&1
+    assert_contains "$(cat "$ZENV_ROOT/a/env")" "format=1" "a new environment should say what format it is"
+}
+
+test_an_env_with_no_format_key_is_format_one() {
+    zenv new a >/dev/null 2>&1 || return 1
+    # Environments made before the key existed have none, and must keep working.
+    t_body=$(grep -v '^format=' "$ZENV_ROOT/a/env")
+    printf '%s\n' "$t_body" >"$ZENV_ROOT/a/env"
+    assert_status 0 zenv exec a -- true
+}
+
+test_an_env_from_a_newer_zenv_is_refused_not_guessed_at() {
+    zenv new a >/dev/null 2>&1 || return 1
+    t_body=$(sed 's/^format=1$/format=2/' "$ZENV_ROOT/a/env")
+    printf '%s\n' "$t_body" >"$ZENV_ROOT/a/env"
+    assert_status 1 zenv exec a -- true
+    assert_contains "$OUT" "newer zenv" "it should say the environment is from a newer zenv"
+    assert_contains "$OUT" "upgrade zenv" "and what to do about it"
+}
+
 test_new_refuses_to_overwrite_an_existing_env() {
     zenv new a >/dev/null 2>&1
     printf 'sentinel\n' >"$ZENV_ROOT/a/zeek/keep-me"

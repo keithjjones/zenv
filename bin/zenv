@@ -18,7 +18,12 @@
 
 set -u
 
-ZENV_VERSION=0.1.1
+ZENV_VERSION=0.1.3
+
+# The layout of an environment's metadata file. Written into every new environment.
+# A zenv refuses an environment whose format is newer than this one rather than
+# reading it wrong, so bump this only when an older zenv would misread the layout.
+ZENV_ENV_FORMAT=1
 
 # Rewritten by `install.sh --root DIR` to bake a machine-wide default. Empty
 # means "no installed default", so `zenv root` can tell level 2 from level 3.
@@ -529,6 +534,20 @@ _env_file() { printf '%s' "$(_env_dir "$1")/env"; }
 # an env, so a stray file or a half-made directory is skipped, not fatal.
 _env_exists() { [ -f "$(_env_file "$1")" ]; }
 
+# An environment written by a newer zenv may hold things this one would misread, so
+# it is refused rather than guessed at. A file with no format key predates the key,
+# and is format 1.
+_env_check_format() {
+    _ecf=$(_env_get "$1" format) || _ecf=1
+    case $_ecf in
+        '' | *[!0-9]*) _die "environment $1 has an unreadable format '$_ecf' in its metadata" ;;
+    esac
+    if [ "$_ecf" -gt "$ZENV_ENV_FORMAT" ]; then
+        _die "environment $1 was made by a newer zenv (format $_ecf; this one reads format $ZENV_ENV_FORMAT)
+      upgrade zenv to use it"
+    fi
+}
+
 _require_env() {
     _check_name "${1:-}"
     if ! _env_exists "$1"; then
@@ -536,6 +555,7 @@ _require_env() {
         _die "no such environment: $1 (looked for $ZENV_ROOT_RESOLVED/$1/env)
       'zenv list' shows what exists; 'zenv new $1' creates it"
     fi
+    _env_check_format "$1"
 }
 
 # Read a key from an env's metadata, falling back to the layout default so an
@@ -943,6 +963,7 @@ cmd_new() {
 _write_env_meta() {
     {
         printf '# zenv environment metadata. Edited by zenv; safe to read.\n'
+        printf 'format=%s\n' "$ZENV_ENV_FORMAT"
         printf 'name=%s\n' "$1"
         printf 'prefix=%s\n' "$3"
         printf 'zkg_dir=%s\n' "$4"
@@ -4307,7 +4328,7 @@ EOF
 # pretending to succeed.
 cmd_activate_hint() {
     _warn "'zenv $1' cannot work as a subprocess: it has to run in your shell"
-    _say "  set it up once:  eval \"\$(zenv init zsh)\"   (add to ~/.zprofile)"
+    _say "  set it up once:  eval \"\$(zenv init zsh)\"   (add to ~/.zshrc)"
     # Offer the env's own stub only when it is really there. A hint naming a file
     # that does not exist is worse than the eval form, which always works.
     _hintstub=

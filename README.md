@@ -19,13 +19,13 @@ shell's environment when you activate.
 ```
 
 That copies `zenv` to `~/.local/bin`, installs the bash and zsh completions, and adds one
-marked block to your rc file:
+marked block to your rc file (`~/.zshrc` on zsh):
 
 ```sh
 # >>> zenv >>>
 # Added by zenv's install.sh. 'zenv uninstall' removes this block exactly.
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH" ;; esac
-eval "$(zenv init sh)"
+eval "$(zenv init zsh)"
 # <<< zenv <<<
 ```
 
@@ -128,6 +128,26 @@ use them:
   that never activate anything.
 - [`uninstall`](docs/USER_GUIDE.md#uninstalling-completely) — what it removes, and the one
   thing it keeps.
+
+## Upgrading
+
+Get the new code into the checkout you installed from (`git pull`), then rerun the installer
+from it:
+
+```sh
+./install.sh
+```
+
+Your environments are not touched. The rc block is updated if this version writes a different one. The copy in
+`~/.local/bin` does not follow the checkout, so until you rerun the installer, `zenv` is still
+the old version. Open a new shell, then confirm:
+
+```sh
+zenv version
+```
+
+Going back to an older version, a checkout you have deleted, and what else an upgrade touches
+are in [Upgrading](docs/USER_GUIDE.md#upgrading).
 
 ## Uninstall
 

@@ -233,6 +233,54 @@ test_a_second_install_does_not_add_a_second_block() {
     assert_contains "$OUT" 'already in' "and install.sh should say why"
 }
 
+test_a_reinstall_updates_an_rc_block_from_an_older_version() {
+    premachine
+    t_before=$(snap_home)
+    # The block as an older zenv wrote it: the eval, without the PATH line.
+    printf '%s\n' '# >>> zenv >>>' 'eval "$(zenv init sh)"' '# <<< zenv <<<' >>"$T_RC"
+
+    run_install
+    assert_eq 1 "$(grep -cxF '# >>> zenv >>>' "$T_RC")" "there should still be one block"
+    assert_contains "$(cat "$T_RC")" 'case ":$PATH:"' "which should now have this version's PATH line"
+    assert_contains "$OUT" 'updated the zenv block' "and install.sh should say so"
+
+    assert_status 0 "$T_BIN" uninstall --yes
+    assert_eq "$t_before" "$(snap_home)" "and uninstall should remove the updated block cleanly"
+}
+
+test_a_reinstall_keeps_the_lines_around_an_updated_rc_block() {
+    premachine
+    printf '%s\n' '# >>> zenv >>>' 'eval "$(zenv init sh)"' '# <<< zenv <<<' 'export AFTER_BLOCK=1' >>"$T_RC"
+
+    run_install
+    # Everything outside the block, and in its order, is exactly what it was.
+    t_outside=$(sed '/^# >>> zenv >>>$/,/^# <<< zenv <<<$/d' "$T_RC")
+    assert_eq "$(printf '%s\n' 'export EDITOR=vi' '# a line of my own' 'export AFTER_BLOCK=1')" \
+        "$t_outside" "the lines outside the block should be untouched"
+    assert_contains "$(cat "$T_RC")" 'case ":$PATH:"' "and the block should now be this version's"
+}
+
+test_a_reinstall_leaves_an_rc_block_someone_edited_alone() {
+    premachine
+    printf '%s\n' '# >>> zenv >>>' 'export MY_OWN=1' 'eval "$(zenv init sh)"' '# <<< zenv <<<' >>"$T_RC"
+    t_before=$(cat "$T_RC")
+
+    run_install
+    assert_eq "$t_before" "$(cat "$T_RC")" "a block with lines zenv did not write should not change"
+    assert_contains "$OUT" 'left as it is' "and install.sh should say so"
+}
+
+test_a_reinstall_leaves_an_unterminated_rc_block_alone() {
+    premachine
+    # A start marker with no end marker: rewriting it would run to the end of the file.
+    printf '%s\n' '# >>> zenv >>>' 'eval "$(zenv init sh)"' 'export AFTER_BLOCK=1' >>"$T_RC"
+    t_before=$(cat "$T_RC")
+
+    run_install
+    assert_eq "$t_before" "$(cat "$T_RC")" "a block with no end marker should not be rewritten"
+    assert_contains "$OUT" 'left as it is' "and install.sh should say so"
+}
+
 test_a_reinstall_leaves_one_copy_and_changes_nothing_else() {
     premachine
     run_install >/dev/null || return 1
@@ -252,6 +300,24 @@ test_a_reinstall_leaves_one_copy_and_changes_nothing_else() {
     printf '#!/bin/sh\nZENV_ROOT_DEFAULT=""\necho stale\n' >"$T_BIN"
     run_install >/dev/null || return 1
     assert_eq "$t_snap" "$(snap_home)" "and a stale copy should be overwritten"
+}
+
+test_an_upgrade_over_an_install_keeps_your_environments() {
+    premachine
+    run_install >/dev/null || return 1
+    assert_status 0 "$T_BIN" new dev
+    t_snap=$(snap_home)
+
+    # The upgrade in the docs: the installer is rerun from a checkout of the new
+    # code over an install that already has environments in it. A stale script
+    # stands in for the old version, and the rerun must replace it and touch
+    # nothing else -- not the environment, not the rc block, not the backup.
+    printf '#!/bin/sh\nZENV_ROOT_DEFAULT=""\necho old\n' >"$T_BIN"
+    run_install >/dev/null || return 1
+    assert_eq "$t_snap" "$(snap_home)" \
+        "an upgrade should leave environments and the rc file alone"
+    assert_status 0 "$T_BIN" list --names
+    assert_contains "$OUT" 'dev' "and the environment should still be listed"
 }
 
 test_a_failed_bake_leaves_no_half_written_script() {
@@ -559,6 +625,24 @@ test_an_rc_file_zenv_created_is_removed_with_its_block() {
     assert_status 0 "$T_BIN" uninstall --yes
     assert_eq "$t_snap" "$(snap_home)" \
         "an rc file holding nothing but the block should go with it"
+}
+
+test_zsh_puts_the_block_in_zshrc_even_when_zprofile_exists() {
+    premachine
+    # zsh reads .zprofile only for login shells, and the zenv function the block
+    # defines is for interactive ones. An existing .zprofile used to win.
+    SHELL=/bin/zsh
+    export SHELL
+    T_RC=$HOME/.zshrc
+    printf 'export FROM_ZPROFILE=1\n' >"$HOME/.zprofile"
+    t_snap=$(snap_home)
+
+    run_install
+    assert_contains "$(cat "$T_RC")" 'zenv init zsh' "the block should go in .zshrc"
+    assert_not_contains "$(cat "$HOME/.zprofile")" 'zenv' "and not in .zprofile"
+    assert_status 0 "$T_BIN" uninstall --yes
+    assert_eq "$t_snap" "$(snap_home)" \
+        "uninstall should find the block in .zshrc and leave no trace"
 }
 
 test_uninstall_without_a_tty_refuses_rather_than_guessing() {

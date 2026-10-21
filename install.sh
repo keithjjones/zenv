@@ -184,8 +184,10 @@ first_existing() {
 pick_rc() {
     case ${SHELL:-/bin/sh} in
         *zsh)
-            first_existing "$HOME/.zprofile" "$HOME/.zshrc" \
-                || printf '%s' "$HOME/.zprofile"
+            # Not .zprofile: zsh reads that only for login shells, and the zenv
+            # function the block defines is for interactive ones. .zshrc is read
+            # by every interactive shell, login or not.
+            printf '%s' "$HOME/.zshrc"
             ;;
         *bash)
             first_existing "$HOME/.bash_profile" "$HOME/.bashrc" "$HOME/.profile" \
@@ -227,6 +229,80 @@ case ":\$PATH:" in *":\$HOME/$SUBDIR/bin:"*) ;; *) PATH="\$HOME/$SUBDIR/bin:\$PA
 eval "\$(zenv init $1)"
 $RC_END
 EOF
+}
+
+# The lines a zenv block may hold: comments, and the lines install.sh writes. Anything
+# else means someone edited the block, so it is left alone. 'zenv uninstall' applies
+# the same rule from the other side.
+# shellcheck disable=SC2016
+#   The case patterns are literal text to match against the block, so their `$`
+#   must not expand.
+rc_body_is_zenvs() {
+    while IFS= read -r _rbl; do
+        case $_rbl in
+            '' | '#'*) : ;;
+            'case ":$PATH:"'*) : ;;
+            'eval "$(zenv init'*) : ;;
+            *) return 1 ;;
+        esac
+    done
+    return 0
+}
+
+# The block currently in $1, markers included. Nothing when there is none.
+rc_block_in() {
+    awk -v b="$RC_BEGIN" -v e="$RC_END" '
+        $0 == b { on = 1 }
+        on { print }
+        $0 == e { on = 0 }
+    ' "$1"
+}
+
+# Replace the block in $1 with the one in $2, keeping every other byte. Written
+# through cat rather than mv, so an rc file that is a symlink stays a symlink.
+rc_refresh() {
+    _rrt=$(mktemp) || die "cannot make a temporary file"
+    awk -v b="$RC_BEGIN" -v e="$RC_END" -v blk="$2" '
+        $0 == b && !seen {
+            while ((getline line < blk) > 0) print line
+            close(blk)
+            seen = 1
+            skip = 1
+            next
+        }
+        skip { if ($0 == e) skip = 0; next }
+        { print }
+    ' "$1" >"$_rrt" && cat "$_rrt" >"$1"
+    _rrs=$?
+    rm -f "$_rrt"
+    [ "$_rrs" -eq 0 ] || die "cannot update the zenv block in $1"
+}
+
+# Bring the block already in $1 up to date with the one this install.sh writes for
+# shell $2. A block holding lines zenv did not write is left as it is, and says so.
+rc_update() {
+    _rcu_want=$(rc_block "$2")
+    _rcu_have=$(rc_block_in "$1")
+    if [ "$_rcu_want" = "$_rcu_have" ]; then
+        say "  the zenv block is already in $1 and up to date -- left as it is"
+        say "  (nothing is added twice: the environment must not be applied twice)"
+        return 0
+    fi
+    _rcu_body=$(printf '%s\n' "$_rcu_have" | sed '1d;$d')
+    if ! grep -qxF "$RC_END" "$1" || ! printf '%s\n' "$_rcu_body" | rc_body_is_zenvs; then
+        say "  the zenv block in $1 differs from this version's, and zenv cannot match all of it"
+        say "  to its own lines -- left as it is. Delete it and rerun install.sh to replace it"
+        return 0
+    fi
+    if [ -n "$DRY" ]; then
+        say "  would update the zenv block in $1"
+        return 0
+    fi
+    _rcu_blk=$(mktemp) || die "cannot make a temporary file"
+    rc_block "$2" >"$_rcu_blk"
+    rc_refresh "$1" "$_rcu_blk"
+    rm -f "$_rcu_blk"
+    say "  updated the zenv block in $1 to this version's"
 }
 
 # ---------------------------------------------------------------------------
@@ -326,8 +402,7 @@ EOF
 
     if [ -n "$RC_HAS" ]; then
         say ""
-        say "  the zenv block is already in $RC_HAS -- left as it is"
-        say "  (nothing is added twice: the environment must not be applied twice)"
+        rc_update "$RC_HAS" "$(init_shell_for "$RC_HAS")"
     else
         if [ -z "$RC" ]; then
             case ${SHELL:-} in
@@ -365,7 +440,7 @@ say ""
 case ":${PATH:-}:" in
     *":$BASE/bin:"*) : ;;
     *)
-        say "$BASE/bin is not on this shell's PATH yet. The block above fixes that"
+        say "$BASE/bin is not on this shell's PATH yet. The zenv block fixes that"
         say "for new shells; for this one: PATH=\"$BASE/bin:\$PATH\""
         say ""
         ;;

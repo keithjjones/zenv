@@ -570,6 +570,46 @@ Per environment:
 - which `zkg` resolves first, whether it is the environment's own, and whether its interpreter
   can import `git` and `semantic_version` (the bundled `zkg` hard-fails without them)
 
+## Upgrading
+
+An upgrade is the installer run again from a checkout of the new code. Get the new code into
+the checkout first (`git pull`, or check out the version you want), then:
+
+```sh
+./install.sh
+```
+
+The copy in `~/.local/bin` is made at install time and does not follow the checkout, so a
+`git pull` by itself changes nothing you run. Rerunning the installer does this:
+
+- replaces `~/.local/bin/zenv` with the checkout's `bin/zenv`. The root baked into the old copy
+  is kept, and only `--root` replaces it.
+- overwrites the bash and zsh completions.
+- brings the zenv block in your rc file up to date, if this version writes a different one. The
+  block is replaced in place, and every line outside it is left as it was. The block is never
+  added twice, and the `<rcfile>.zenv-pre-install` backup from your first install is not
+  overwritten.
+- never writes under `$ZENV_ROOT`, so your environments are not touched. They are not rewritten
+  either, and an environment made by an older zenv keeps working.
+
+Afterwards, open a new shell. A shell that was already open keeps the `zenv` shell function it
+loaded at startup. Then confirm with `zenv version`.
+
+**Going back** works the same way: check out the older commit and run `./install.sh` from it.
+The installer copies whatever `bin/zenv` the checkout holds.
+
+**If you have deleted the checkout**, the installed `zenv` keeps working, but the installer
+needs a checkout to copy from. Clone the repository again, check out the version you want, and
+run `./install.sh` from there.
+
+**If you have edited the zenv block**, the installer leaves it alone and says so, because it
+cannot tell your change from an old zenv block. To take the new block, delete the lines from
+`# >>> zenv >>>` through `# <<< zenv <<<` in the rc file, then rerun `./install.sh`.
+
+**Environments carry a `format` key** (see [the env file reference](#zenv_rootnameenv)). A zenv
+refuses to use an environment whose format is newer than its own, and says to upgrade. So if
+an environment you made with a newer zenv is refused, upgrade zenv rather than editing the file.
+
 ## Uninstalling completely
 
 ```sh
@@ -637,7 +677,7 @@ while they are real directories, refuses to follow a symlink out of the root, an
 a build tree, a `~/.zkg/clones` cache or an installed package.
 
 `./install.sh` copies your rc file to `<rcfile>.zenv-pre-install` before its first edit, so
-`mv ~/.zprofile.zenv-pre-install ~/.zprofile` restores the pre-zenv file byte-for-byte —
+`mv ~/.zshrc.zenv-pre-install ~/.zshrc` restores the pre-zenv file byte-for-byte —
 including any lines you removed yourself, which zenv did not write and will not put back.
 Uninstall reports that path when it exists, and keeps a backup that differs from the current
 file rather than deleting it.
@@ -701,6 +741,7 @@ sourced.
 
 | Key | Meaning |
 |---|---|
+| `format` | the layout of this file. Currently `1`; a file with no `format` key is format 1. A zenv refuses an environment whose format is newer than its own, and says to upgrade |
 | `name` | the environment's name |
 | `prefix` | its install prefix |
 | `zkg_dir` | its zkg config and state directory |
